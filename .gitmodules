@@ -1,0 +1,7 @@
+[submodule "lib/commonlibsf"]
+	path = lib/commonlibsf
+	url = https://github.com/libxse/commonlibsf.git
+
+[submodule "lib/commonlib-shared"]
+	path = lib/commonlib-shared
+	url = https://github.com/libxse/commonlib-shared.git
