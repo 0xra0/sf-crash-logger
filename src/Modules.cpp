@@ -33,40 +33,44 @@ namespace Modules
         return std::filesystem::path(path).parent_path() / "Data" / "SFSE" / "Plugins";
     }
 
-    static BOOL CALLBACK EnumModulesCallback(PCSTR moduleName, DWORD64 moduleBase, ULONG moduleSize, PVOID userContext)
-    {
-        auto* modules = static_cast<std::vector<ModuleInfo>*>(userContext);
-
-        char pathBuf[MAX_PATH] = {};
-        HANDLE process = GetCurrentProcess();
-
-        HMODULE hmod = reinterpret_cast<HMODULE>(moduleBase);
-        GetModuleFileNameExA(process, hmod, pathBuf, MAX_PATH);
-
-        ModuleInfo info;
-        info.name = moduleName;
-        info.path = pathBuf;
-        info.base = moduleBase;
-        info.size = moduleSize;
-        info.version = GetFileVersion(pathBuf);
-
-        // Check if it lives in the SFSE plugins directory
-        try {
-            auto pluginsDir  = GetSFSEPluginsDir();
-            auto modulePath  = std::filesystem::path(pathBuf);
-            info.isSFSEPlugin = modulePath.parent_path() == pluginsDir;
-        } catch (...) {}
-
-        modules->push_back(std::move(info));
-        return TRUE;
-    }
-
     std::vector<ModuleInfo> GetAll()
     {
         std::vector<ModuleInfo> modules;
         modules.reserve(128);
 
-        EnumerateLoadedModulesA64(GetCurrentProcess(), EnumModulesCallback, &modules);
+        HANDLE  process = GetCurrentProcess();
+        HMODULE hMods[1024]{};
+        DWORD   cbNeeded = 0;
+
+        if (!EnumProcessModules(process, hMods, sizeof(hMods), &cbNeeded))
+            return modules;
+
+        const DWORD count = cbNeeded / sizeof(HMODULE);
+        for (DWORD i = 0; i < count; ++i) {
+            char       nameBuf[MAX_PATH]{};
+            char       pathBuf[MAX_PATH]{};
+            MODULEINFO modInfo{};
+
+            if (!GetModuleInformation(process, hMods[i], &modInfo, sizeof(modInfo)))
+                continue;
+
+            GetModuleBaseNameA(process, hMods[i], nameBuf, MAX_PATH);
+            GetModuleFileNameExA(process, hMods[i], pathBuf, MAX_PATH);
+
+            ModuleInfo info;
+            info.name    = nameBuf;
+            info.path    = pathBuf;
+            info.base    = reinterpret_cast<std::uint64_t>(modInfo.lpBaseOfDll);
+            info.size    = modInfo.SizeOfImage;
+            info.version = GetFileVersion(pathBuf);
+
+            try {
+                auto pluginsDir   = GetSFSEPluginsDir();
+                info.isSFSEPlugin = (std::filesystem::path(pathBuf).parent_path() == pluginsDir);
+            } catch (...) {}
+
+            modules.push_back(std::move(info));
+        }
 
         // Sort: game exe first, then SFSE plugins, then the rest alphabetically
         std::sort(modules.begin(), modules.end(), [](const ModuleInfo& a, const ModuleInfo& b) {

@@ -159,12 +159,6 @@ namespace CrashHandler
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    static BOOL CALLBACK PatchAllIATsCallback(PCSTR, DWORD64 moduleBase, ULONG, PVOID)
-    {
-        PatchModuleIAT(reinterpret_cast<HMODULE>(moduleBase));
-        return TRUE;
-    }
-
     // -------------------------------------------------------------------------
 
     void Install()
@@ -175,9 +169,17 @@ namespace CrashHandler
         // 2. Primary SEH filter
         s_previousFilter = SetUnhandledExceptionFilter(SEHFilter);
 
-        // 3. Patch SetUnhandledExceptionFilter in every currently-loaded module's IAT
-        //    so future calls from those modules are silently blocked.
-        EnumerateLoadedModulesA64(GetCurrentProcess(), PatchAllIATsCallback, nullptr);
+        // 3. Patch SetUnhandledExceptionFilter in every currently-loaded module's IAT.
+        //    Use PSAPI EnumProcessModules to avoid DbgHelp A/W naming issues.
+        {
+            HMODULE hMods[1024]{};
+            DWORD   cbNeeded = 0;
+            if (EnumProcessModules(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded)) {
+                const DWORD count = cbNeeded / sizeof(HMODULE);
+                for (DWORD i = 0; i < count; ++i)
+                    PatchModuleIAT(hMods[i]);
+            }
+        }
 
         REX::INFO("CrashHandler installed (SEH filter + VEH fallback + {} IAT patches).",
             "all loaded modules");

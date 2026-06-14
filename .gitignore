@@ -1,0 +1,21 @@
+# Build output
+build/
+
+# xmake cache
+.xmake/
+
+# xwin download cache
+.xwin-cache/
+
+# VS generated files
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+
+# Compiler output
+*.obj
+*.pdb
+*.exp
+*.ilk

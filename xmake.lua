@@ -1,3 +1,7 @@
+-- Custom module search path: project-local overrides before system modules.
+-- Needed for find_rc.lua which is Windows-only upstream but we run on Linux.
+add_moduledirs("modules")
+
 -- include subprojects (git submodules)
 includes("lib/commonlibsf")
 
@@ -34,5 +38,5 @@ target("CrashLogger")
     add_includedirs("include")
     set_pcxxheader("include/PCH.h")
 
-    -- Windows system libraries required for DbgHelp, version info, shell
-    add_syslinks("DbgHelp", "Version", "Shell32", "Ole32")
+    -- Windows system libraries (lowercase to match xwin SDK filenames on case-sensitive Linux)
+    add_syslinks("dbghelp", "psapi", "version", "shell32", "ole32")
