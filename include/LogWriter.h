@@ -24,4 +24,8 @@ namespace LogWriter
         EXCEPTION_POINTERS*        ep,
         const std::filesystem::path& logDir,
         const std::string&           fileTimestamp);
+
+    // Appends a "loaded" entry to CrashLogger.log in the Crashlogs directory.
+    // Call once from SFSE_PLUGIN_LOAD to confirm the plugin is active each session.
+    void WriteStartupLog();
 }

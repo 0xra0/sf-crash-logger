@@ -178,6 +178,21 @@ namespace LogWriter
         REX::INFO("Crash log: {}", logPath.string());
     }
 
+    void WriteStartupLog()
+    {
+        const auto logDir = GetLogDir();
+        std::filesystem::create_directories(logDir);
+
+        const auto logPath = logDir / "CrashLogger.log";
+        std::ofstream out(logPath, std::ios::out | std::ios::app);
+        if (!out)
+            return;
+
+        out << std::format("[{}] CrashLogger v0.1.0 loaded — crash logs -> {}\n",
+            ReadableTimestamp(), logDir.string());
+        out.flush();
+    }
+
     void WriteMiniDump(
         EXCEPTION_POINTERS*          ep,
         const std::filesystem::path& logDir,

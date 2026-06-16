@@ -19,3 +19,9 @@ build/
 *.pdb
 *.exp
 *.ilk
+*.lib
+*.dll
+
+# OS
+.DS_Store
+Thumbs.db
