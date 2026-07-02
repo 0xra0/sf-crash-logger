@@ -14,11 +14,11 @@ namespace LogWriter
     std::filesystem::path GetLogDir();
 
     void Write(
-        EXCEPTION_POINTERS*                        ep,
-        const std::vector<StackFrame>&             frames,
-        const std::vector<ModuleInfo>&             modules,
-        const std::vector<RTTIReader::RegisterObject>& rttiObjects,
-        const std::string&                         fileTimestamp);
+        EXCEPTION_POINTERS*                ep,
+        const std::vector<StackFrame>&     frames,
+        const std::vector<ScannedValue>&   scanned,
+        const std::vector<ModuleInfo>&     modules,
+        const std::string&                 fileTimestamp);
 
     void WriteMiniDump(
         EXCEPTION_POINTERS*        ep,

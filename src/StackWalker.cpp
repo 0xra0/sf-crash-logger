@@ -97,4 +97,42 @@ namespace StackWalker
         SymCleanup(process);
         return result;
     }
+
+    std::vector<ScannedValue> ScanStack(const CONTEXT* ctx, std::size_t maxBytes)
+    {
+        std::vector<ScannedValue> result;
+
+        const std::uint64_t rsp = ctx->Rsp;
+        if (rsp == 0)
+            return result;
+
+        __try {
+            // Clamp the read window to the end of the committed stack region so
+            // we never touch the guard page (which would itself fault).
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(rsp), &mbi, sizeof(mbi)) == 0)
+                return result;
+
+            const std::uint64_t regionEnd =
+                reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+            std::uint64_t end = rsp + maxBytes;
+            if (end > regionEnd)
+                end = regionEnd;
+
+            result.reserve(256);
+            for (std::uint64_t addr = (rsp + 7) & ~std::uint64_t{ 7 }; addr + 8 <= end; addr += 8) {
+                const auto value = *reinterpret_cast<const std::uint64_t*>(addr);
+
+                // Keep only values that could be a canonical user-mode pointer.
+                // Non-pointer scalars and small integers are filtered by the caller
+                // when it fails to resolve them to a module or RTTI object.
+                if (value >= 0x10000 && value <= 0x7FFFFFFEFFFF)
+                    result.push_back({ addr, value });
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+        return result;
+    }
 }

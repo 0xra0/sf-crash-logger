@@ -50,11 +50,11 @@ namespace CrashHandler
             const auto timestamp = LogWriter::MakeFileTimestamp();
             const auto logDir    = LogWriter::GetLogDir();
 
-            auto modules     = Modules::GetAll();
-            auto frames      = StackWalker::Walk(ep->ContextRecord);
-            auto rttiObjects = RTTIReader::IdentifyRegisters(ep->ContextRecord);
+            auto modules = Modules::GetAll();
+            auto frames  = StackWalker::Walk(ep->ContextRecord);
+            auto scanned = StackWalker::ScanStack(ep->ContextRecord);
 
-            LogWriter::Write(ep, frames, modules, rttiObjects, timestamp);
+            LogWriter::Write(ep, frames, scanned, modules, timestamp);
             LogWriter::WriteMiniDump(ep, logDir, timestamp);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {

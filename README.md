@@ -5,12 +5,17 @@ An [SFSE](https://sfse.silverlock.org/) plugin for Starfield that captures crash
 ## Features
 
 - **Exception handler** installed at preload — catches crashes from all plugins, not just ones that load after us
+- **Fault analysis** — classifies the access violation (near-null dereference + field offset, `-1`/sentinel pointer) and names the faulting module inline
+- **Culprit summary** — lists every SFSE plugin found anywhere on the stack, so "which mod was running" is answered without a debugger
 - **Stack trace** with symbol names and source locations (when PDB is present)
-- **Register dump** (RAX–R15, RIP, EFLAGS)
-- **RTTI object identification** — reads pointer-sized register values and resolves them to C++ type names via the game's RTTI metadata
+- **Stack scan** — linearly scans raw stack memory for return addresses and object pointers, recovering the deeper frames the strict frame-pointer unwinder drops in optimised engine code (no external tooling needed)
+- **Register dump** (RAX–R15, RIP, EFLAGS) plus **register targets** — each register annotated with `module+offset` (code) or its RTTI type (live game object)
+- **RTTI object identification** — resolves pointer-sized values to C++ type names via the game's RTTI metadata
 - **Minidump** (`.dmp`) compatible with WinDbg / Visual Studio
 - **Module list** with base addresses, sizes, and version strings; SFSE plugins flagged separately
 - **Startup log** — appends a timestamped line to `CrashLogger.log` every game launch so you can confirm the plugin is active
+
+All analysis runs inside the plugin at crash time — the `.log` is self-contained and readable without symbols, WinDbg, or any post-processing script.
 
 ## Crash log location
 

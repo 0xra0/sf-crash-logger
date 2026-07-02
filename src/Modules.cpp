@@ -82,12 +82,18 @@ namespace Modules
         return modules;
     }
 
-    std::string NameFromAddress(std::uint64_t address, const std::vector<ModuleInfo>& modules)
+    const ModuleInfo* FindModule(std::uint64_t address, const std::vector<ModuleInfo>& modules)
     {
         for (const auto& m : modules) {
             if (address >= m.base && address < m.base + m.size)
-                return m.name;
+                return &m;
         }
-        return {};
+        return nullptr;
+    }
+
+    std::string NameFromAddress(std::uint64_t address, const std::vector<ModuleInfo>& modules)
+    {
+        const auto* m = FindModule(address, modules);
+        return m ? m->name : std::string{};
     }
 }

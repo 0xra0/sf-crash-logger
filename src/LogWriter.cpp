@@ -39,6 +39,65 @@ namespace LogWriter
         return std::format("  Detail:  {} at address 0x{:016X}\n", op, rec->ExceptionInformation[1]);
     }
 
+    // Classify an access-violation fault address into a human-readable hint so a
+    // reader doesn't need a debugger to recognise the common failure shapes.
+    static std::string FaultAnalysis(const EXCEPTION_RECORD* rec)
+    {
+        if ((rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
+             rec->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) ||
+            rec->NumberParameters < 2)
+            return {};
+
+        const auto addr = rec->ExceptionInformation[1];
+        if (addr < 0x1000)
+            return std::format(
+                "  Note:    near-null dereference — likely a null pointer read at field offset +0x{:X}\n",
+                addr);
+        if (addr == 0xFFFFFFFFFFFFFFFFull)
+            return "  Note:    read at 0xFFFF...FFFF — invalid/sentinel pointer (freed or corrupted object)\n";
+        return {};
+    }
+
+    // Base address of this plugin's own module. Used to exclude ourselves from
+    // the "culprit" list — the crash handler is always on the stack.
+    static std::uint64_t SelfModuleBase()
+    {
+        HMODULE h = nullptr;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(&SelfModuleBase), &h) &&
+            h)
+            return reinterpret_cast<std::uint64_t>(h);
+        return 0;
+    }
+
+    // "module+0xoffset" for an address inside a loaded module, else empty.
+    static std::string ModuleOffset(std::uint64_t addr, const std::vector<ModuleInfo>& modules)
+    {
+        const auto* m = Modules::FindModule(addr, modules);
+        if (!m)
+            return {};
+        return std::format("{}+0x{:X}", m->name, addr - m->base);
+    }
+
+    // Resolve a pointer-sized value to something meaningful: a module+offset
+    // (a return address / code pointer), or an RTTI-typed game object on the heap.
+    // Returns empty for values that are neither (plain data / non-pointers).
+    static std::string Annotate(std::uint64_t value, const std::vector<ModuleInfo>& modules)
+    {
+        if (const auto* m = Modules::FindModule(value, modules)) {
+            auto s = std::format("{}+0x{:X}", m->name, value - m->base);
+            if (m->isSFSEPlugin)
+                s += "  [SFSE]";
+            return s;
+        }
+        // Not inside any module image — might be a live object. Ask the RTTI reader.
+        auto type = RTTIReader::GetTypeName(value);
+        if (!type.empty())
+            return std::format("<object: {}>", type);
+        return {};
+    }
+
     static std::string ReadableTimestamp()
     {
         auto now  = std::chrono::system_clock::now();
@@ -71,11 +130,11 @@ namespace LogWriter
     }
 
     void Write(
-        EXCEPTION_POINTERS*                            ep,
-        const std::vector<StackFrame>&                 frames,
-        const std::vector<ModuleInfo>&                 modules,
-        const std::vector<RTTIReader::RegisterObject>& rttiObjects,
-        const std::string&                             fileTimestamp)
+        EXCEPTION_POINTERS*              ep,
+        const std::vector<StackFrame>&   frames,
+        const std::vector<ScannedValue>& scanned,
+        const std::vector<ModuleInfo>&   modules,
+        const std::string&               fileTimestamp)
     {
         const auto logDir = GetLogDir();
         std::filesystem::create_directories(logDir);
@@ -93,21 +152,54 @@ namespace LogWriter
         out << std::format("Timestamp: {}\n\n", ReadableTimestamp());
 
         // ------------------------------------------------------------------ exception
+        const auto  excAddr = reinterpret_cast<std::uint64_t>(rec->ExceptionAddress);
+        const auto  excMod  = ModuleOffset(excAddr, modules);
+        const auto* excModI = Modules::FindModule(excAddr, modules);
+
         out << "EXCEPTION\n";
         out << std::format("  Code:    0x{:08X} ({})\n", rec->ExceptionCode, ExceptionCodeName(rec->ExceptionCode));
-        out << std::format("  Address: 0x{:016X}", reinterpret_cast<std::uint64_t>(rec->ExceptionAddress));
-
-        const auto crashMod = Modules::NameFromAddress(
-            reinterpret_cast<std::uint64_t>(rec->ExceptionAddress), modules);
-        if (!crashMod.empty())
-            out << std::format(" ({})", crashMod);
+        out << std::format("  Address: 0x{:016X}", excAddr);
+        if (!excMod.empty())
+            out << std::format(" ({}{})", excMod, (excModI && excModI->isSFSEPlugin) ? " [SFSE]" : "");
         out << "\n";
 
         if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
             out << AccessViolationDetail(rec);
+            out << FaultAnalysis(rec);
         }
         out << "\n";
+
+        // ------------------------------------------------------------------ analysis
+        // List SFSE plugins that appear anywhere on the stack (unwound frames plus
+        // scanned return addresses) — the quickest "which mod was running" pointer.
+        {
+            const auto selfBase = SelfModuleBase();
+
+            std::vector<std::string> pluginsOnStack;
+            auto note = [&](std::uint64_t addr) {
+                const auto* m = Modules::FindModule(addr, modules);
+                if (m && m->isSFSEPlugin && m->base != selfBase &&
+                    std::find(pluginsOnStack.begin(), pluginsOnStack.end(), m->name) == pluginsOnStack.end())
+                    pluginsOnStack.push_back(m->name);
+            };
+            for (const auto& f : frames)
+                note(f.address);
+            for (const auto& s : scanned)
+                note(s.value);
+
+            out << "ANALYSIS\n";
+            out << std::format("  Faulting module: {}\n", excMod.empty() ? "unknown" : excMod);
+            if (pluginsOnStack.empty()) {
+                out << "  No SFSE-plugin code on the stack — the crash is inside the game engine\n";
+                out << "  (a mod may still be responsible via altered data/forms).\n";
+            } else {
+                out << "  SFSE plugins present on the stack (possible culprits):\n";
+                for (const auto& p : pluginsOnStack)
+                    out << std::format("    - {}\n", p);
+            }
+            out << "\n";
+        }
 
         // ------------------------------------------------------------------ registers
         out << "REGISTERS\n";
@@ -122,17 +214,30 @@ namespace LogWriter
         out << std::format("  RIP: {:016X}  EFL: {:08X}\n", ctx->Rip, ctx->EFlags);
         out << "\n";
 
-        // ------------------------------------------------------------------ RTTI objects
-        if (!rttiObjects.empty()) {
-            out << "PROBABLE GAME OBJECTS (from registers)\n";
-            for (const auto& obj : rttiObjects)
-                out << std::format("  {:3s}: 0x{:016X}  -> {}\n",
-                    obj.regName, obj.value, obj.typeName);
-            out << "\n";
+        // ------------------------------------------------------------------ register targets
+        // Annotate each register with what it points at: module+offset for code
+        // (function/vtable/return address), or an RTTI type for live game objects.
+        {
+            const std::pair<const char*, std::uint64_t> regs[] = {
+                { "RAX", ctx->Rax }, { "RCX", ctx->Rcx }, { "RDX", ctx->Rdx }, { "RBX", ctx->Rbx },
+                { "RBP", ctx->Rbp }, { "RSI", ctx->Rsi }, { "RDI", ctx->Rdi }, { "R8",  ctx->R8  },
+                { "R9",  ctx->R9  }, { "R10", ctx->R10 }, { "R11", ctx->R11 }, { "R12", ctx->R12 },
+                { "R13", ctx->R13 }, { "R14", ctx->R14 }, { "R15", ctx->R15 }, { "RIP", ctx->Rip },
+            };
+            std::string body;
+            for (const auto& [name, value] : regs) {
+                auto ann = Annotate(value, modules);
+                if (!ann.empty())
+                    body += std::format("  {:>3}: 0x{:016X}  -> {}\n", name, value, ann);
+            }
+            if (!body.empty()) {
+                out << "REGISTER TARGETS (registers pointing at code or game objects)\n";
+                out << body << "\n";
+            }
         }
 
         // ------------------------------------------------------------------ stack trace
-        out << std::format("STACK TRACE ({} frames)\n", frames.size());
+        out << std::format("STACK TRACE ({} frames, frame-pointer unwind)\n", frames.size());
         for (std::size_t i = 0; i < frames.size(); ++i) {
             const auto& f = frames[i];
 
@@ -157,6 +262,31 @@ namespace LogWriter
 
             if (!f.sourceFile.empty())
                 out << std::format("          {}:{}\n", f.sourceFile, f.sourceLine);
+        }
+        out << "\n";
+
+        // ------------------------------------------------------------------ stack scan
+        // Every value on the raw stack that resolves to a module (return address)
+        // or a live RTTI object. Recovers the deeper frames the strict unwinder
+        // above drops when optimised code omits frame-pointer/unwind data.
+        out << "STACK SCAN (resolvable pointers on the stack; RSP-relative offsets)\n";
+        {
+            std::size_t   shown     = 0;
+            std::uint64_t lastValue = 0;
+            for (const auto& s : scanned) {
+                if (s.value == lastValue)   // collapse runs of the same pointer
+                    continue;
+                auto ann = Annotate(s.value, modules);
+                if (ann.empty())
+                    continue;               // skip plain data / non-pointers
+                lastValue = s.value;
+                out << std::format("  [RSP+0x{:04X}] 0x{:016X}  {}\n",
+                    s.stackAddress - ctx->Rsp, s.value, ann);
+                if (++shown >= 200)         // bound very deep stacks
+                    break;
+            }
+            if (shown == 0)
+                out << "  (no resolvable pointers found)\n";
         }
         out << "\n";
 
