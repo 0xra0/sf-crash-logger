@@ -5,6 +5,8 @@ An [SFSE](https://sfse.silverlock.org/) plugin for Starfield that captures crash
 ## Features
 
 - **Exception handler** installed at preload — catches crashes from all plugins, not just ones that load after us
+- **Early-warning breadcrumb trace** — a continuously-appended, crash-durable log (`CrashLogger_trace.log`) of first-chance exceptions and lifecycle markers written *before* the crash. Uses raw `WriteFile` (survives `TerminateProcess`, unlike a buffered stream) and an allocation-free path (works on a corrupted heap), so it leaves evidence even for the crashes that produce **no `.dmp` and no crash log** — stack overflows, fail-fast/heap-corruption trips, and hard kills. The last breadcrumbs are also embedded in each crash report
+- **Termination / fail-fast backstop** — IAT hooks on `RaiseFailFastException`, self-`TerminateProcess`, and `std::terminate` capture a stack and emit a full `.log`+`.dmp` for abnormal exits that bypass the normal SEH filter. (A raw compiler `__fastfail`/`int 29h` — a smashed `/GS` cookie or heap-manager corruption trip — still can't be caught in-process; for those the Wine/Proton log via `PROTON_LOG=1` is the source of truth.)
 - **Fault analysis** — classifies the access violation (near-null dereference + field offset, `-1`/sentinel pointer) and names the faulting module inline
 - **Culprit summary** — lists every SFSE plugin found anywhere on the stack, so "which mod was running" is answered without a debugger
 - **Stack trace** with symbol names and source locations (when PDB is present)
@@ -26,7 +28,8 @@ All analysis runs inside the plugin at crash time — the `.log` is self-contain
 | File | Contents |
 |------|----------|
 | `CrashLogger.log` | One line per game session — confirms the plugin loaded |
-| `crash_<timestamp>.log` | Full crash report (exception, registers, stack, modules) |
+| `CrashLogger_trace.log` | Rolling early-warning trace (first-chance exceptions + lifecycle), flushed as it happens — the only survivor when a crash produces no dump |
+| `crash_<timestamp>.log` | Full crash report (exception, breadcrumbs, registers, stack, modules) |
 | `crash_<timestamp>.dmp` | Minidump for debugger analysis |
 
 ## Installation

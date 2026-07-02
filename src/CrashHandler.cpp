@@ -1,14 +1,29 @@
 #include "PCH.h"
 #include "CrashHandler.h"
+#include "Breadcrumbs.h"
 #include "LogWriter.h"
 #include "Modules.h"
 #include "RTTIReader.h"
 #include "StackWalker.h"
 
+#include <cstdlib>
+#include <exception>
+
 namespace CrashHandler
 {
     static LPTOP_LEVEL_EXCEPTION_FILTER s_previousFilter = nullptr;
     static std::atomic_bool             s_handled{ false };
+
+    // Real entry points behind our IAT stubs, resolved once at install time so
+    // the stubs can still perform the actual operation after logging.
+    using RaiseFailFastException_t = void (WINAPI*)(PEXCEPTION_RECORD, PCONTEXT, DWORD);
+    using TerminateProcess_t       = BOOL (WINAPI*)(HANDLE, UINT);
+    using ExitProcess_t            = void (WINAPI*)(UINT);
+
+    static RaiseFailFastException_t s_realRaiseFailFast    = nullptr;
+    static TerminateProcess_t       s_realTerminateProcess = nullptr;
+    static ExitProcess_t            s_realExitProcess      = nullptr;
+    static std::terminate_handler   s_prevTerminate        = nullptr;
 
     // -------------------------------------------------------------------------
     // Exception codes that represent genuine, fatal crashes.
@@ -46,6 +61,11 @@ namespace CrashHandler
         if (s_handled.exchange(true))
             return;
 
+        // Guaranteed, allocation-free record first — flushed to disk before the
+        // rich writer runs, so we leave evidence even if that writer itself faults
+        // (e.g. on a corrupted heap).
+        Breadcrumbs::LogFatal(ep);
+
         __try {
             const auto timestamp = LogWriter::MakeFileTimestamp();
             const auto logDir    = LogWriter::GetLogDir();
@@ -60,6 +80,86 @@ namespace CrashHandler
         __except (EXCEPTION_EXECUTE_HANDLER) {
             REX::ERROR("CrashHandler: secondary exception while writing crash log.");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Report a crash for which the OS never handed us EXCEPTION_POINTERS (a
+    // fail-fast, a self-TerminateProcess, or std::terminate). We synthesise the
+    // record/context from the current call site so the same pipeline produces a
+    // full .log and .dmp captured at the point the process is dying.
+    // -------------------------------------------------------------------------
+    static void ReportSynthetic(DWORD code, PEXCEPTION_RECORD rec, PCONTEXT ctx)
+    {
+        CONTEXT          localCtx{};
+        EXCEPTION_RECORD localRec{};
+
+        if (!ctx) {
+            RtlCaptureContext(&localCtx);
+            ctx = &localCtx;
+        }
+        if (!rec) {
+            localRec.ExceptionCode    = code;
+            localRec.ExceptionFlags   = EXCEPTION_NONCONTINUABLE;
+            localRec.ExceptionAddress = reinterpret_cast<PVOID>(ctx->Rip);
+            rec = &localRec;
+        }
+
+        EXCEPTION_POINTERS ep{ rec, ctx };
+        ProcessCrash(&ep);
+    }
+
+    // -------------------------------------------------------------------------
+    // Termination / fail-fast backstop stubs (installed into module IATs).
+    //
+    // These catch the abnormal-exit paths that BYPASS the SEH filter and VEH:
+    // RaiseFailFastException, an engine self-TerminateProcess, and std::terminate.
+    // NOTE: a raw compiler __fastfail / int 29h (a smashed /GS stack cookie or a
+    // heap-manager corruption trip) still cannot be caught in-process by design —
+    // for those the Wine/Proton log (PROTON_LOG=1) remains the source of truth.
+    // -------------------------------------------------------------------------
+    static void WINAPI StubRaiseFailFastException(PEXCEPTION_RECORD rec, PCONTEXT ctx, DWORD flags)
+    {
+        Breadcrumbs::Log("RaiseFailFastException (flags=0x%lX) — fail-fast, capturing stack",
+            static_cast<unsigned long>(flags));
+        ReportSynthetic(rec ? rec->ExceptionCode : 0xC0000602 /*STATUS_FAIL_FAST_EXCEPTION*/, rec, ctx);
+
+        if (s_realRaiseFailFast)
+            s_realRaiseFailFast(rec, ctx, flags);   // never returns
+        if (s_realTerminateProcess)                 // ... but be certain we die
+            s_realTerminateProcess(GetCurrentProcess(), rec ? rec->ExceptionCode : 0xC0000602);
+    }
+
+    static BOOL WINAPI StubTerminateProcess(HANDLE hProcess, UINT code)
+    {
+        const bool self = hProcess == GetCurrentProcess() ||
+                          GetProcessId(hProcess) == GetCurrentProcessId();
+        if (self) {
+            Breadcrumbs::Log("TerminateProcess(self, code=0x%X)", code);
+            // A code of 0 is a normal fast-exit (skip destructors); only capture a
+            // full report for abnormal (non-zero) self-termination.
+            if (code != 0)
+                ReportSynthetic(0xE0000001 /*synthetic: self-terminate*/, nullptr, nullptr);
+        }
+        return s_realTerminateProcess ? s_realTerminateProcess(hProcess, code) : FALSE;
+    }
+
+    static void WINAPI StubExitProcess(UINT code)
+    {
+        // Clean-exit path — a breadcrumb only, no crash report (avoids false
+        // positives when the player simply quits the game).
+        Breadcrumbs::Log("ExitProcess(code=0x%X)", code);
+        if (s_realExitProcess)
+            s_realExitProcess(code);   // never returns
+    }
+
+    // std::terminate — unhandled C++ exception or a noexcept violation.
+    static void OnTerminate()
+    {
+        Breadcrumbs::Log("std::terminate — unhandled C++ exception / noexcept violation");
+        ReportSynthetic(0xE0000002 /*synthetic: std::terminate*/, nullptr, nullptr);
+        if (s_prevTerminate)
+            s_prevTerminate();
+        std::abort();
     }
 
     // -------------------------------------------------------------------------
@@ -108,8 +208,20 @@ namespace CrashHandler
         return SEHFilter;
     }
 
+    // Kernel32/kernelbase imports we redirect in every module's IAT.
+    struct IATHook {
+        const char* name;
+        void*       stub;
+    };
+    static const IATHook s_iatHooks[] = {
+        { "SetUnhandledExceptionFilter", reinterpret_cast<void*>(&StubSetUnhandledExceptionFilter) },
+        { "RaiseFailFastException",      reinterpret_cast<void*>(&StubRaiseFailFastException)       },
+        { "TerminateProcess",            reinterpret_cast<void*>(&StubTerminateProcess)             },
+        { "ExitProcess",                 reinterpret_cast<void*>(&StubExitProcess)                  },
+    };
+
     // -------------------------------------------------------------------------
-    // Patch the IAT entry for SetUnhandledExceptionFilter inside a single module.
+    // Patch the IAT entries for every hooked import inside a single module.
     // Checks both "KERNEL32.DLL" and "kernelbase.dll" import names.
     // -------------------------------------------------------------------------
     static void PatchModuleIAT(HMODULE hModule)
@@ -144,15 +256,18 @@ namespace CrashHandler
 
                     auto* ibn = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(
                         base + origThunk->u1.AddressOfData);
-                    if (_stricmp(ibn->Name, "SetUnhandledExceptionFilter") != 0)
-                        continue;
 
-                    // Found the IAT slot — overwrite it with our stub
-                    DWORD oldProtect = 0;
-                    VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProtect);
-                    thunk->u1.Function = reinterpret_cast<ULONGLONG>(&StubSetUnhandledExceptionFilter);
-                    VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
-                    return;
+                    for (const auto& hook : s_iatHooks) {
+                        if (_stricmp(ibn->Name, hook.name) != 0)
+                            continue;
+
+                        // Found a hooked import — overwrite the IAT slot with our stub.
+                        DWORD oldProtect = 0;
+                        VirtualProtect(&thunk->u1.Function, sizeof(void*), PAGE_READWRITE, &oldProtect);
+                        thunk->u1.Function = reinterpret_cast<ULONGLONG>(hook.stub);
+                        VirtualProtect(&thunk->u1.Function, sizeof(void*), oldProtect, &oldProtect);
+                        break;
+                    }
                 }
             }
         }
@@ -163,13 +278,23 @@ namespace CrashHandler
 
     void Install()
     {
+        // 0. Resolve the real entry points our IAT stubs forward to, and route
+        //    std::terminate through our reporter (bypasses the SEH filter otherwise).
+        if (HMODULE k32 = GetModuleHandleW(L"kernel32.dll")) {
+            s_realRaiseFailFast    = reinterpret_cast<RaiseFailFastException_t>(GetProcAddress(k32, "RaiseFailFastException"));
+            s_realTerminateProcess = reinterpret_cast<TerminateProcess_t>(GetProcAddress(k32, "TerminateProcess"));
+            s_realExitProcess      = reinterpret_cast<ExitProcess_t>(GetProcAddress(k32, "ExitProcess"));
+        }
+        s_prevTerminate = std::set_terminate(&OnTerminate);
+
         // 1. VEH fallback (registered first, cannot be removed by other plugins)
         AddVectoredExceptionHandler(1, VEHFallback);
 
         // 2. Primary SEH filter
         s_previousFilter = SetUnhandledExceptionFilter(SEHFilter);
 
-        // 3. Patch SetUnhandledExceptionFilter in every currently-loaded module's IAT.
+        // 3. Patch the hooked kernel32/kernelbase imports (SEH filter + termination
+        //    backstop) in every currently-loaded module's IAT.
         //    Use PSAPI EnumProcessModules to avoid DbgHelp A/W naming issues.
         {
             HMODULE hMods[1024]{};
@@ -181,7 +306,6 @@ namespace CrashHandler
             }
         }
 
-        REX::INFO("CrashHandler installed (SEH filter + VEH fallback + {} IAT patches).",
-            "all loaded modules");
+        REX::INFO("CrashHandler installed (SEH filter + VEH fallback + termination/fail-fast IAT hooks).");
     }
 }

@@ -1,5 +1,6 @@
 #include "PCH.h"
 #include "LogWriter.h"
+#include "Breadcrumbs.h"
 
 namespace LogWriter
 {
@@ -148,7 +149,7 @@ namespace LogWriter
         const auto* ctx = ep->ContextRecord;
 
         // ------------------------------------------------------------------ header
-        out << "Starfield Crash Logger v0.1.0\n";
+        out << "Starfield Crash Logger v0.2.0\n";
         out << std::format("Timestamp: {}\n\n", ReadableTimestamp());
 
         // ------------------------------------------------------------------ exception
@@ -199,6 +200,21 @@ namespace LogWriter
                     out << std::format("    - {}\n", p);
             }
             out << "\n";
+        }
+
+        // ------------------------------------------------------------------ breadcrumbs
+        // The most recent early-warning trace lines (first-chance exceptions and
+        // lifecycle markers) leading up to this crash. The full history — including
+        // any prior silent-death session that produced no dump — is in the
+        // continuously-flushed CrashLogger_trace.log alongside this file.
+        {
+            const auto recent = Breadcrumbs::Recent();
+            if (!recent.empty()) {
+                out << "RECENT BREADCRUMBS (newest last; full trail in CrashLogger_trace.log)\n";
+                for (const auto& line : recent)
+                    out << "  " << line << "\n";
+                out << "\n";
+            }
         }
 
         // ------------------------------------------------------------------ registers
@@ -318,7 +334,7 @@ namespace LogWriter
         if (!out)
             return;
 
-        out << std::format("[{}] CrashLogger v0.1.0 loaded — crash logs -> {}\n",
+        out << std::format("[{}] CrashLogger v0.2.0 loaded — crash logs -> {}\n",
             ReadableTimestamp(), logDir.string());
         out.flush();
     }
