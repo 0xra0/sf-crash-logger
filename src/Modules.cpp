@@ -72,28 +72,31 @@ namespace Modules
             modules.push_back(std::move(info));
         }
 
-        // Sort: game exe first, then SFSE plugins, then the rest alphabetically
+        // Sort by base address so FindModule can binary-search. Module images
+        // never overlap, so base order is a total order over [base, base+size).
+        // Presentation order (SFSE plugins first, then alphabetical) is applied by
+        // the log writer on a copy when it prints the module list.
         std::sort(modules.begin(), modules.end(), [](const ModuleInfo& a, const ModuleInfo& b) {
-            if (a.isSFSEPlugin != b.isSFSEPlugin)
-                return a.isSFSEPlugin > b.isSFSEPlugin;
-            return a.name < b.name;
+            return a.base < b.base;
         });
 
         return modules;
     }
 
+    // Binary search over base-sorted modules (see GetAll). Called once per
+    // scanned stack value and per register target, so O(log n) matters on the
+    // deep stacks the scanner produces.
     const ModuleInfo* FindModule(std::uint64_t address, const std::vector<ModuleInfo>& modules)
     {
-        for (const auto& m : modules) {
-            if (address >= m.base && address < m.base + m.size)
-                return &m;
-        }
+        // First module whose base is strictly greater than address; the candidate
+        // containing address, if any, is the one immediately before it.
+        auto it = std::upper_bound(modules.begin(), modules.end(), address,
+            [](std::uint64_t addr, const ModuleInfo& m) { return addr < m.base; });
+        if (it == modules.begin())
+            return nullptr;
+        --it;
+        if (address >= it->base && address < it->base + it->size)
+            return &*it;
         return nullptr;
-    }
-
-    std::string NameFromAddress(std::uint64_t address, const std::vector<ModuleInfo>& modules)
-    {
-        const auto* m = FindModule(address, modules);
-        return m ? m->name : std::string{};
     }
 }

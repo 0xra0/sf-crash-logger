@@ -11,6 +11,7 @@ namespace Breadcrumbs
     static constexpr std::size_t kLineMax        = 512;   // one formatted record
     static constexpr std::size_t kRingCount      = 32;    // recent lines kept in RAM
     static constexpr std::uint32_t kMaxFirstChance = 2000; // cap noisy sessions
+    static constexpr std::uintmax_t kTraceRotateBytes = 4 * 1024 * 1024; // rotate over 4 MiB
 
     // --- state --------------------------------------------------------------
     static HANDLE           s_file = INVALID_HANDLE_VALUE;
@@ -26,6 +27,16 @@ namespace Breadcrumbs
     // First-chance de-dup / rate-limit (best-effort; minor races are harmless).
     static std::atomic<std::uint64_t> s_lastFirstChanceKey{ 0 };
     static std::atomic<std::uint32_t> s_firstChanceCount{ 0 };
+
+    // Reserve stack so the top-level SEH filter can still run after a stack
+    // overflow (which otherwise leaves no stack for the handler). This is a
+    // per-thread setting, so it must be applied on every thread — see the TLS
+    // callback below, which runs it as each thread starts.
+    static void ApplyStackGuarantee() noexcept
+    {
+        ULONG guarantee = 64 * 1024;
+        SetThreadStackGuarantee(&guarantee);
+    }
 
     // ------------------------------------------------------------------------
     static const char* CodeName(DWORD code) noexcept
@@ -225,14 +236,25 @@ namespace Breadcrumbs
         InitializeCriticalSection(&s_ringLock);
         s_ringLockInit = true;
 
-        // Reserve stack so the SEH filter can still run on a stack-overflow crash.
-        ULONG guarantee = 64 * 1024;
-        SetThreadStackGuarantee(&guarantee);
+        // Cover the loading thread now; the TLS callback covers every thread
+        // created from here on (and this same one, redundantly and harmlessly).
+        ApplyStackGuarantee();
 
         std::error_code ec;
         const auto dir = LogWriter::GetLogDir();
         std::filesystem::create_directories(dir, ec);
         const auto path = dir / "CrashLogger_trace.log";
+
+        // Rotate before opening so the trace cannot grow without bound across the
+        // many sessions it deliberately appends to. When the live file passes the
+        // cap, move it aside to a single ".old" companion (overwriting any prior
+        // one); the immediately-preceding session — the one most likely to hold a
+        // silent-death trail — is thus always preserved, and disk stays bounded.
+        if (std::filesystem::file_size(path, ec) > kTraceRotateBytes && !ec) {
+            const auto old = dir / "CrashLogger_trace.log.old";
+            std::filesystem::remove(old, ec);
+            std::filesystem::rename(path, old, ec);
+        }
 
         // Append across sessions (a silent-death crash leaves its trail for the
         // relaunch to preserve). FILE_APPEND_DATA gives atomic multi-thread
@@ -253,4 +275,33 @@ namespace Breadcrumbs
         if (s_file != INVALID_HANDLE_VALUE)
             FlushFileBuffers(s_file);
     }
+
+    // ------------------------------------------------------------------------
+    // TLS callback — the loader invokes it on this DLL's own thread-attach for
+    // every thread the game spawns after we load, which is where the stack
+    // guarantee has to be applied (it is per-thread). Kept minimal and
+    // allocation-free: it runs under the loader lock. Threads that already
+    // existed when we loaded are not notified, but at preload almost none do.
+    // ------------------------------------------------------------------------
+    static void NTAPI TlsThreadCallback(PVOID, DWORD reason, PVOID) noexcept
+    {
+        if (reason == DLL_THREAD_ATTACH || reason == DLL_PROCESS_ATTACH)
+            ApplyStackGuarantee();
+    }
+}
+
+// Emit a TLS directory and anchor the callback in .CRT$XLB so the loader calls
+// it. The /INCLUDE directives stop the linker from stripping either symbol.
+// (x64 symbol names carry no leading underscore.)
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:crashlogger_tls_callback")
+
+extern "C" {
+// The explicit `extern` gives the anchor external linkage; without it a
+// namespace-scope const is internal under clang-cl and the linker strips it
+// despite /INCLUDE, leaving the callback unregistered.
+extern const PIMAGE_TLS_CALLBACK crashlogger_tls_callback;
+#pragma const_seg(".CRT$XLB")
+const PIMAGE_TLS_CALLBACK crashlogger_tls_callback = &Breadcrumbs::TlsThreadCallback;
+#pragma const_seg()
 }

@@ -49,8 +49,12 @@ namespace StackWalker
 
         std::lock_guard lock(s_dbghelpMutex);
 
-        SymInitialize(process, nullptr, TRUE);
+        // Set options BEFORE SymInitialize: with fInvadeProcess = TRUE it enumerates
+        // and registers every loaded module up front, and only SYMOPT_DEFERRED_LOADS
+        // (which must already be set at that point) keeps it from eagerly loading
+        // every PDB — an expensive, heap-heavy operation at the worst possible moment.
         SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS);
+        SymInitialize(process, nullptr, TRUE);
 
         STACKFRAME64 frame{};
         frame.AddrPC.Offset    = ctxCopy.Rip;

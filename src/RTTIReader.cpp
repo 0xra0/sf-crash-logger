@@ -132,24 +132,4 @@ namespace RTTIReader
             return {};
         }
     }
-
-    std::vector<RegisterObject> IdentifyRegisters(const CONTEXT* ctx)
-    {
-        // General-purpose registers and their names
-        const std::pair<const char*, std::uint64_t> regs[] = {
-            { "RAX", ctx->Rax }, { "RBX", ctx->Rbx }, { "RCX", ctx->Rcx },
-            { "RDX", ctx->Rdx }, { "RSI", ctx->Rsi }, { "RDI", ctx->Rdi },
-            { "RBP", ctx->Rbp }, { "R8",  ctx->R8  }, { "R9",  ctx->R9  },
-            { "R10", ctx->R10 }, { "R11", ctx->R11 }, { "R12", ctx->R12 },
-            { "R13", ctx->R13 }, { "R14", ctx->R14 }, { "R15", ctx->R15 },
-        };
-
-        std::vector<RegisterObject> result;
-        for (const auto& [name, value] : regs) {
-            auto typeName = GetTypeName(value);
-            if (!typeName.empty())
-                result.push_back({ name, value, std::move(typeName) });
-        }
-        return result;
-    }
 }

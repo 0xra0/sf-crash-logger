@@ -28,7 +28,7 @@ All analysis runs inside the plugin at crash time — the `.log` is self-contain
 | File | Contents |
 |------|----------|
 | `CrashLogger.log` | One line per game session — confirms the plugin loaded |
-| `CrashLogger_trace.log` | Rolling early-warning trace (first-chance exceptions + lifecycle), flushed as it happens — the only survivor when a crash produces no dump |
+| `CrashLogger_trace.log` | Rolling early-warning trace (first-chance exceptions + lifecycle), flushed as it happens — the only survivor when a crash produces no dump. Rotated to `.old` past 4 MiB |
 | `crash_<timestamp>.log` | Full crash report (exception, breadcrumbs, registers, stack, modules) |
 | `crash_<timestamp>.dmp` | Minidump for debugger analysis |
 

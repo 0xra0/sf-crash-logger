@@ -18,6 +18,9 @@ SFSE_PLUGIN_PRELOAD(const SFSE::PreLoadInterface* a_sfse)
 SFSE_PLUGIN_LOAD(const SFSE::LoadInterface* a_sfse)
 {
     SFSE::Init(a_sfse);
+    // Every other SFSE plugin is loaded by now: patch the IATs they brought with
+    // them, which did not exist when Install() ran at preload.
+    CrashHandler::OnPostLoad();
     LogWriter::WriteStartupLog();
     Breadcrumbs::Log("plugin load complete — game running");
     REX::INFO("CrashLogger loaded. Crash logs -> {}", LogWriter::GetLogDir().string());

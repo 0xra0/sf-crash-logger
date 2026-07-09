@@ -121,13 +121,30 @@ namespace LogWriter
             tm.tm_hour, tm.tm_min, tm.tm_sec);
     }
 
+    // Fallback log root when the Documents known-folder cannot be resolved:
+    // next to the game executable. Never returns a path built from a null
+    // pointer (which would be undefined behaviour).
+    static std::filesystem::path FallbackLogRoot()
+    {
+        wchar_t exe[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, exe, MAX_PATH) > 0)
+            return std::filesystem::path(exe).parent_path();
+        return std::filesystem::current_path();
+    }
+
     std::filesystem::path GetLogDir()
     {
         wchar_t* docsPath = nullptr;
-        SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &docsPath);
-        std::filesystem::path dir(docsPath);
-        CoTaskMemFree(docsPath);
-        return dir / "My Games" / "Starfield" / "SFSE" / "Crashlogs";
+        const HRESULT hr  = SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &docsPath);
+
+        std::filesystem::path dir;
+        if (SUCCEEDED(hr) && docsPath)
+            dir = std::filesystem::path(docsPath) / "My Games" / "Starfield";
+        else
+            dir = FallbackLogRoot();
+
+        CoTaskMemFree(docsPath);   // documented to be safe on failure / null
+        return dir / "SFSE" / "Crashlogs";
     }
 
     void Write(
@@ -307,8 +324,17 @@ namespace LogWriter
         out << "\n";
 
         // ------------------------------------------------------------------ modules
+        // `modules` arrives base-sorted (for FindModule); present it the readable
+        // way instead — SFSE plugins first, then everything else alphabetically.
         out << std::format("MODULES ({} loaded)\n", modules.size());
-        for (const auto& m : modules) {
+        auto displayModules = modules;
+        std::sort(displayModules.begin(), displayModules.end(),
+            [](const ModuleInfo& a, const ModuleInfo& b) {
+                if (a.isSFSEPlugin != b.isSFSEPlugin)
+                    return a.isSFSEPlugin > b.isSFSEPlugin;
+                return a.name < b.name;
+            });
+        for (const auto& m : displayModules) {
             out << std::format("  {:40s}  base: 0x{:016X}  size: 0x{:08X}",
                 m.name, m.base, m.size);
             if (!m.version.empty())
