@@ -1,5 +1,6 @@
 #include "PCH.h"
 #include "LogWriter.h"
+#include "AddressLibrary.h"
 #include "Breadcrumbs.h"
 
 namespace LogWriter
@@ -72,6 +73,15 @@ namespace LogWriter
         return 0;
     }
 
+    // "  ID: <id>+0xoffset" if the address resolves to an Address Library ID
+    // (only game-executable addresses do), else empty.
+    static std::string IdSuffix(std::uint64_t addr)
+    {
+        if (auto r = AddressLibrary::Resolve(addr))
+            return std::format("  ID: {}+0x{:X}", r->id, r->displacement);
+        return {};
+    }
+
     // "module+0xoffset" for an address inside a loaded module, else empty.
     static std::string ModuleOffset(std::uint64_t addr, const std::vector<ModuleInfo>& modules)
     {
@@ -90,6 +100,7 @@ namespace LogWriter
             auto s = std::format("{}+0x{:X}", m->name, value - m->base);
             if (m->isSFSEPlugin)
                 s += "  [SFSE]";
+            s += IdSuffix(value);
             return s;
         }
         // Not inside any module image — might be a live object. Ask the RTTI reader.
@@ -167,7 +178,8 @@ namespace LogWriter
 
         // ------------------------------------------------------------------ header
         out << "Starfield Crash Logger v0.2.0\n";
-        out << std::format("Timestamp: {}\n\n", ReadableTimestamp());
+        out << std::format("Timestamp: {}\n", ReadableTimestamp());
+        out << std::format("Address Library: {}\n\n", AddressLibrary::Status());
 
         // ------------------------------------------------------------------ exception
         const auto  excAddr = reinterpret_cast<std::uint64_t>(rec->ExceptionAddress);
@@ -179,7 +191,7 @@ namespace LogWriter
         out << std::format("  Address: 0x{:016X}", excAddr);
         if (!excMod.empty())
             out << std::format(" ({}{})", excMod, (excModI && excModI->isSFSEPlugin) ? " [SFSE]" : "");
-        out << "\n";
+        out << IdSuffix(excAddr) << "\n";
 
         if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
@@ -207,7 +219,8 @@ namespace LogWriter
                 note(s.value);
 
             out << "ANALYSIS\n";
-            out << std::format("  Faulting module: {}\n", excMod.empty() ? "unknown" : excMod);
+            out << std::format("  Faulting module: {}{}\n",
+                excMod.empty() ? "unknown" : excMod, IdSuffix(excAddr));
             if (pluginsOnStack.empty()) {
                 out << "  No SFSE-plugin code on the stack — the crash is inside the game engine\n";
                 out << "  (a mod may still be responsible via altered data/forms).\n";
@@ -291,7 +304,7 @@ namespace LogWriter
                 if (!moduleCtx.empty())
                     out << std::format("  [{}]", moduleCtx);
             }
-            out << "\n";
+            out << IdSuffix(f.address) << "\n";
 
             if (!f.sourceFile.empty())
                 out << std::format("          {}:{}\n", f.sourceFile, f.sourceLine);
