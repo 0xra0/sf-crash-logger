@@ -32,6 +32,63 @@ namespace LogWriter
         }
     }
 
+    // Well-known debug-allocator fill patterns. A value that is one of these
+    // (optionally plus a small field offset, from dereferencing a poison pointer)
+    // pins the bug class instantly — no debugger needed.
+    struct PoisonPattern
+    {
+        std::uint32_t word;
+        const char*   meaning;
+    };
+    static constexpr PoisonPattern kPoison[] = {
+        { 0xCDCDCDCD, "uninitialized heap memory (new/malloc'd, never written)" },
+        { 0xCCCCCCCC, "uninitialized stack memory" },
+        { 0xDDDDDDDD, "freed heap memory (use-after-free)" },
+        { 0xFEEEFEEE, "freed heap memory (use-after-free)" },
+        { 0xFDFDFDFD, "heap guard bytes (buffer over/underrun)" },
+        { 0xABABABAB, "freed HeapAlloc guard bytes (use-after-free)" },
+        { 0xBAADF00D, "uninitialized memory (LocalAlloc)" },
+        { 0xDEADBEEF, "sentinel / poison value" },
+    };
+
+    // If `value` is a poison pattern (or a poison pointer plus a small field
+    // offset), return "<pattern> +0xNN" describing it, else empty.
+    static std::string PoisonName(std::uint64_t value)
+    {
+        for (const auto& p : kPoison) {
+            const std::uint64_t base = (static_cast<std::uint64_t>(p.word) << 32) | p.word;
+            if (value >= base && value - base <= 0x10000) {
+                const auto off = value - base;
+                return off == 0 ? std::format("0x{:08X} — {}", p.word, p.meaning)
+                                : std::format("0x{:08X}+0x{:X} — {}", p.word, off, p.meaning);
+            }
+        }
+        return {};
+    }
+
+    // Find the general-purpose register whose value the fault address is based on
+    // (fault == reg + small offset). Returns the closest such register, or empty.
+    struct RegHit { const char* name; std::uint64_t value; std::uint64_t offset; };
+    static std::optional<RegHit> CorrelateFaultRegister(std::uint64_t faultAddr, const CONTEXT* ctx)
+    {
+        constexpr std::uint64_t kWindow = 0x10000;   // 64 KiB — covers large structs
+        const std::pair<const char*, std::uint64_t> regs[] = {
+            { "RAX", ctx->Rax }, { "RCX", ctx->Rcx }, { "RDX", ctx->Rdx }, { "RBX", ctx->Rbx },
+            { "RBP", ctx->Rbp }, { "RSI", ctx->Rsi }, { "RDI", ctx->Rdi }, { "R8",  ctx->R8  },
+            { "R9",  ctx->R9  }, { "R10", ctx->R10 }, { "R11", ctx->R11 }, { "R12", ctx->R12 },
+            { "R13", ctx->R13 }, { "R14", ctx->R14 }, { "R15", ctx->R15 },
+        };
+        std::optional<RegHit> best;
+        for (const auto& [name, value] : regs) {
+            if (faultAddr < value || faultAddr - value > kWindow)
+                continue;
+            const auto off = faultAddr - value;
+            if (!best || off < best->offset)
+                best = RegHit{ name, value, off };
+        }
+        return best;
+    }
+
     static std::string AccessViolationDetail(const EXCEPTION_RECORD* rec)
     {
         if (rec->NumberParameters < 2)
@@ -41,9 +98,10 @@ namespace LogWriter
         return std::format("  Detail:  {} at address 0x{:016X}\n", op, rec->ExceptionInformation[1]);
     }
 
-    // Classify an access-violation fault address into a human-readable hint so a
-    // reader doesn't need a debugger to recognise the common failure shapes.
-    static std::string FaultAnalysis(const EXCEPTION_RECORD* rec)
+    // Classify an access-violation fault address into human-readable hints so a
+    // reader doesn't need a debugger to recognise the common failure shapes:
+    // near-null / sentinel / poison, and which register the address is based on.
+    static std::string FaultAnalysis(const EXCEPTION_RECORD* rec, const CONTEXT* ctx)
     {
         if ((rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
              rec->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) ||
@@ -51,13 +109,35 @@ namespace LogWriter
             return {};
 
         const auto addr = rec->ExceptionInformation[1];
+        std::string out;
+
+        // What the fault address itself looks like.
         if (addr < 0x1000)
-            return std::format(
-                "  Note:    near-null dereference — likely a null pointer read at field offset +0x{:X}\n",
-                addr);
-        if (addr == 0xFFFFFFFFFFFFFFFFull)
-            return "  Note:    read at 0xFFFF...FFFF — invalid/sentinel pointer (freed or corrupted object)\n";
-        return {};
+            out += std::format(
+                "  Note:    near-null dereference — null pointer read at field offset +0x{:X}\n", addr);
+        else if (addr == 0xFFFFFFFFFFFFFFFFull)
+            out += "  Note:    0xFFFF...FFFF — invalid/sentinel pointer (freed or corrupted object)\n";
+        else if (auto p = PoisonName(addr); !p.empty())
+            out += std::format("  Note:    fault address is {}\n", p);
+
+        // Which register the fault address is based on (base pointer + field), and
+        // what that base register holds — often the smoking gun.
+        if (auto hit = CorrelateFaultRegister(addr, ctx)) {
+            std::string base;
+            if (hit->value == 0)
+                base = " — null";
+            else if (auto p = PoisonName(hit->value); !p.empty())
+                base = std::format(" — {}", p);
+
+            if (hit->offset == 0)
+                out += std::format("  Note:    access via {} (= 0x{:016X}{})\n",
+                    hit->name, hit->value, base);
+            else
+                out += std::format("  Note:    access via {}+0x{:X} (field of {} = 0x{:016X}{})\n",
+                    hit->name, hit->offset, hit->name, hit->value, base);
+        }
+
+        return out;
     }
 
     // Base address of this plugin's own module. Used to exclude ourselves from
@@ -107,6 +187,9 @@ namespace LogWriter
         auto type = RTTIReader::GetTypeName(value);
         if (!type.empty())
             return std::format("<object: {}>", type);
+        // Or a recognisable debug-allocator fill pattern (uninitialized/freed).
+        if (auto p = PoisonName(value); !p.empty())
+            return std::format("<poison: {}>", p);
         return {};
     }
 
@@ -196,7 +279,7 @@ namespace LogWriter
         if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
             out << AccessViolationDetail(rec);
-            out << FaultAnalysis(rec);
+            out << FaultAnalysis(rec, ctx);
         }
         out << "\n";
 
