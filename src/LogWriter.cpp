@@ -4,6 +4,7 @@
 #include "Breadcrumbs.h"
 #include "LoadOrder.h"
 #include "SystemInfo.h"
+#include "ThreadInfo.h"
 
 namespace LogWriter
 {
@@ -291,6 +292,8 @@ namespace LogWriter
         if (!excMod.empty())
             out << std::format(" ({}{})", excMod, (excModI && excModI->isSFSEPlugin) ? " [SFSE]" : "");
         out << IdSuffix(excAddr) << "\n";
+        // The same fault means different things on the main thread and on a worker.
+        out << std::format("  Thread:  {}\n", ThreadInfo::Describe(GetCurrentThreadId()));
 
         if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {

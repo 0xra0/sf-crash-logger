@@ -5,6 +5,7 @@
 #include "LoadOrder.h"
 #include "LogWriter.h"
 #include "SystemInfo.h"
+#include "ThreadInfo.h"
 
 // SFSE_PLUGIN_PRELOAD fires before any other plugin initialises.
 // Installing the crash handler here means we also catch crashes from
@@ -13,6 +14,7 @@ SFSE_PLUGIN_PRELOAD(const SFSE::PreLoadInterface* a_sfse)
 {
     SFSE::Init(a_sfse);
     Breadcrumbs::Init();          // early trace + first-chance logger, before anything can crash
+    ThreadInfo::Init();           // records this (the main) thread, starts watching thread names
     CrashHandler::Install();
     Breadcrumbs::Log("crash handler installed (preload)");
     return true;
