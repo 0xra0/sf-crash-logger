@@ -143,6 +143,137 @@ namespace LogWriter
         return out;
     }
 
+    // ---- fault region ------------------------------------------------------
+    // The fault address alone cannot distinguish a wild pointer into never-
+    // allocated space, a write into a read-only image page, a touch of a reserved-
+    // but-uncommitted page, and a stack overflow. Asking the memory manager can.
+    // Kept out of FaultAnalysis so that stays pure.
+
+    static const char* ProtectName(DWORD p)
+    {
+        switch (p & 0xFF) {   // strip PAGE_GUARD / PAGE_NOCACHE / PAGE_WRITECOMBINE
+        case PAGE_NOACCESS:           return "PAGE_NOACCESS";
+        case PAGE_READONLY:           return "PAGE_READONLY";
+        case PAGE_READWRITE:          return "PAGE_READWRITE";
+        case PAGE_WRITECOPY:          return "PAGE_WRITECOPY";
+        case PAGE_EXECUTE:            return "PAGE_EXECUTE";
+        case PAGE_EXECUTE_READ:       return "PAGE_EXECUTE_READ";
+        case PAGE_EXECUTE_READWRITE:  return "PAGE_EXECUTE_READWRITE";
+        case PAGE_EXECUTE_WRITECOPY:  return "PAGE_EXECUTE_WRITECOPY";
+        default:                      return "unknown protection";
+        }
+    }
+
+    static bool ProtectAllowsWrite(DWORD p)
+    {
+        switch (p & 0xFF) {
+        case PAGE_READWRITE: case PAGE_WRITECOPY:
+        case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static bool ProtectAllowsExecute(DWORD p)
+    {
+        switch (p & 0xFF) {
+        case PAGE_EXECUTE: case PAGE_EXECUTE_READ:
+        case PAGE_EXECUTE_READWRITE: case PAGE_EXECUTE_WRITECOPY:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // PAGE_EXECUTE alone grants execute but not read.
+    static bool ProtectAllowsRead(DWORD p)
+    {
+        const DWORD base = p & 0xFF;
+        return base != 0 && base != PAGE_NOACCESS && base != PAGE_EXECUTE;
+    }
+
+    // The whole reserved stack span of the calling thread, committed or not.
+    // Win8+; absent hosts simply skip the stack-overflow note.
+    static bool CurrentThreadStack(std::uint64_t& low, std::uint64_t& high)
+    {
+        auto* k32 = GetModuleHandleW(L"kernel32.dll");
+        if (!k32)
+            return false;
+        using Fn = void(WINAPI*)(PULONG_PTR, PULONG_PTR);
+        auto fn = reinterpret_cast<Fn>(GetProcAddress(k32, "GetCurrentThreadStackLimits"));
+        if (!fn)
+            return false;
+
+        ULONG_PTR l = 0, h = 0;
+        fn(&l, &h);
+        low  = l;
+        high = h;
+        return high > low;
+    }
+
+    // `op` is EXCEPTION_RECORD::ExceptionInformation[0]: 0 read, 1 write, 8 DEP.
+    static std::string FaultRegionDetail(std::uint64_t addr, ULONG_PTR op)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) != sizeof(mbi))
+            return std::format("  Region:  0x{:016X} lies outside the process address space\n", addr);
+
+        std::string out;
+        const auto  base = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
+
+        if (mbi.State == MEM_FREE) {
+            out += "  Region:  not mapped — MEM_FREE, never allocated (wild or stale pointer)\n";
+        } else {
+            const char* state = (mbi.State == MEM_COMMIT) ? "MEM_COMMIT" : "MEM_RESERVE";
+            const char* type  = (mbi.Type == MEM_IMAGE)   ? "MEM_IMAGE"
+                              : (mbi.Type == MEM_MAPPED)  ? "MEM_MAPPED"
+                              : (mbi.Type == MEM_PRIVATE) ? "MEM_PRIVATE"
+                                                          : "unknown type";
+            out += std::format("  Region:  base 0x{:016X}, size 0x{:X}, {}, {}",
+                base, static_cast<std::uint64_t>(mbi.RegionSize), state, type);
+            if (mbi.State == MEM_COMMIT)
+                out += std::format(", {}{}", ProtectName(mbi.Protect),
+                    (mbi.Protect & PAGE_GUARD) ? " | PAGE_GUARD" : "");
+            out += "\n";
+        }
+
+        // Why this particular access was refused, given what the page permits.
+        if (mbi.State == MEM_COMMIT) {
+            if (op == 1 && !ProtectAllowsWrite(mbi.Protect))
+                out += "  Note:    write to non-writable memory\n";
+            else if (op == 8 && !ProtectAllowsExecute(mbi.Protect))
+                out += "  Note:    execute of non-executable memory (DEP)\n";
+            else if (op == 0 && !ProtectAllowsRead(mbi.Protect))
+                out += "  Note:    read from unreadable memory\n";
+
+            if (mbi.Protect & PAGE_GUARD)
+                out += "  Note:    guard page — first touch past the committed region\n";
+        } else if (mbi.State == MEM_RESERVE) {
+            out += "  Note:    address space is reserved but was never committed\n";
+        }
+
+        // Membership in the faulting thread's own stack is what turns an otherwise
+        // anonymous reserved-page fault into a diagnosis of stack overflow.
+        std::uint64_t low = 0, high = 0;
+        if (CurrentThreadStack(low, high) && addr >= low && addr < high) {
+            out += std::format("  Note:    inside this thread's stack (0x{:016X} - 0x{:016X})\n", low, high);
+            if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
+                out += "  Note:    the stack has not grown this far — stack overflow\n";
+        }
+
+        return out;
+    }
+
+    static std::string FaultRegion(const EXCEPTION_RECORD* rec)
+    {
+        if ((rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
+             rec->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) ||
+            rec->NumberParameters < 2)
+            return {};
+        return FaultRegionDetail(rec->ExceptionInformation[1], rec->ExceptionInformation[0]);
+    }
+
     // Base address of this plugin's own module. Used to exclude ourselves from
     // the "culprit" list — the crash handler is always on the stack.
     static std::uint64_t SelfModuleBase()
@@ -299,6 +430,7 @@ namespace LogWriter
             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
             out << AccessViolationDetail(rec);
             out << FaultAnalysis(rec, ctx);
+            out << FaultRegion(rec);
         }
         out << "\n";
 
