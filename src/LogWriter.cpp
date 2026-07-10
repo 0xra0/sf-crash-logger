@@ -2,6 +2,7 @@
 #include "LogWriter.h"
 #include "AddressLibrary.h"
 #include "Breadcrumbs.h"
+#include "CrashSignature.h"
 #include "LoadOrder.h"
 #include "SystemInfo.h"
 #include "ThreadInfo.h"
@@ -408,9 +409,22 @@ namespace LogWriter
         const auto* ctx = ep->ContextRecord;
 
         // ------------------------------------------------------------------ header
+        // Access type feeds the signature: a read and a write at the same site are
+        // different bugs. nullopt for exceptions that carry no access information.
+        std::optional<std::uint32_t> accessOp;
+        if ((rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+            rec->NumberParameters >= 2)
+            accessOp = static_cast<std::uint32_t>(rec->ExceptionInformation[0]);
+
+        const auto signature = CrashSignature::Compute(rec->ExceptionCode, accessOp, frames, modules);
+
         out << std::format("Starfield Crash Logger v{}\n", PluginVersion());
         out << std::format("Timestamp: {}\n", ReadableTimestamp());
-        out << std::format("Address Library: {}\n\n", AddressLibrary::Status());
+        out << std::format("Address Library: {}\n", AddressLibrary::Status());
+        out << std::format("Crash signature: {}\n\n",
+            signature.available ? signature.value
+                                : std::format("unavailable ({})", signature.reason));
 
         // ------------------------------------------------------------------ exception
         const auto  excAddr = reinterpret_cast<std::uint64_t>(rec->ExceptionAddress);
@@ -455,6 +469,15 @@ namespace LogWriter
             out << "ANALYSIS\n";
             out << std::format("  Faulting module: {}{}\n",
                 excMod.empty() ? "unknown" : excMod, IdSuffix(excAddr));
+
+            // Show exactly what the signature hashed, so it can be reproduced and
+            // argued with rather than taken on faith.
+            if (signature.available && !signature.inputs.empty()) {
+                std::string joined = signature.inputs.front();
+                for (std::size_t i = 1; i < signature.inputs.size(); ++i)
+                    joined += std::format(" | {}", signature.inputs[i]);
+                out << std::format("  Signature {} over: {}\n", signature.value, joined);
+            }
             if (pluginsOnStack.empty()) {
                 out << "  No SFSE-plugin code on the stack — the crash is inside the game engine\n";
                 out << "  (a mod may still be responsible via altered data/forms).\n";
