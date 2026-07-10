@@ -28,10 +28,16 @@ namespace Breadcrumbs
     static std::atomic<std::uint64_t> s_lastFirstChanceKey{ 0 };
     static std::atomic<std::uint32_t> s_firstChanceCount{ 0 };
 
-    // Reserve stack so the top-level SEH filter can still run after a stack
-    // overflow (which otherwise leaves no stack for the handler). This is a
-    // per-thread setting, so it must be applied on every thread — see the TLS
-    // callback below, which runs it as each thread starts.
+    // Ask for stack to be held back so a handler can still run after a stack
+    // overflow. Per-thread, hence the TLS callback below that runs it as each
+    // thread starts.
+    //
+    // This is a hint we cannot rely on. Wine accepts the call, returns TRUE and
+    // reads the value back correctly, but commits nothing: a thread that
+    // overflows under Proton still arrives at the VEH with under 2 KiB of usable
+    // stack, and the top-level filter is never reached at all. Native Windows
+    // does honour it. CrashHandler therefore does not depend on either — it moves
+    // the report onto a thread with a stack of its own.
     static void ApplyStackGuarantee() noexcept
     {
         ULONG guarantee = 64 * 1024;
@@ -102,13 +108,15 @@ namespace Breadcrumbs
     }
 
     // Format "[HH:MM:SS.mmm|t<tid>] <msg>\n" into buf without touching the heap.
-    static int FormatLine(char* buf, std::size_t cap, const char* fmt, va_list ap) noexcept
+    // `tid` is passed in rather than read here: the fatal record is written by the
+    // reporter thread, and must still be stamped with the thread that crashed.
+    static int FormatLine(char* buf, std::size_t cap, std::uint32_t tid, const char* fmt, va_list ap) noexcept
     {
         SYSTEMTIME st{};
         GetLocalTime(&st);
         const int pre = std::snprintf(buf, cap, "[%02u:%02u:%02u.%03u|t%lu] ",
             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-            static_cast<unsigned long>(GetCurrentThreadId()));
+            static_cast<unsigned long>(tid));
         if (pre < 0 || static_cast<std::size_t>(pre) >= cap)
             return pre < 0 ? pre : static_cast<int>(cap) - 1;
 
@@ -125,14 +133,11 @@ namespace Breadcrumbs
     }
 
     // ------------------------------------------------------------------------
-    void Log(const char* fmt, ...)
+    static void Emit(std::uint32_t tid, const char* fmt, va_list ap) noexcept
     {
         char buf[kLineMax];
 
-        va_list ap;
-        va_start(ap, fmt);
-        const int len = FormatLine(buf, sizeof(buf), fmt, ap);
-        va_end(ap);
+        const int len = FormatLine(buf, sizeof(buf), tid, fmt, ap);
         if (len <= 0)
             return;
 
@@ -146,8 +151,26 @@ namespace Breadcrumbs
         PushRing(buf);
     }
 
-    void LogFatal(EXCEPTION_POINTERS* ep)
+    // Same as Log(), but stamped with a thread id the caller chooses.
+    static void EmitV(std::uint32_t tid, const char* fmt, ...) noexcept
     {
+        va_list ap;
+        va_start(ap, fmt);
+        Emit(tid, fmt, ap);
+        va_end(ap);
+    }
+
+    void Log(const char* fmt, ...)
+    {
+        va_list ap;
+        va_start(ap, fmt);
+        Emit(GetCurrentThreadId(), fmt, ap);
+        va_end(ap);
+    }
+
+    void LogFatal(const CrashContext& crash)
+    {
+        auto* ep = crash.ep;
         if (!ep || !ep->ExceptionRecord)
             return;
 
@@ -162,7 +185,9 @@ namespace Breadcrumbs
 
         // Pure, loader-lock-free path: no module resolution here (that stays in
         // the rich writer). Just the raw facts, then force to physical disk.
-        Log("FATAL %s (0x%08lX) at 0x%016llX faultaddr=0x%016llX",
+        // Stamped with the crashing thread, which for a stack overflow is not the
+        // thread running this code.
+        EmitV(crash.threadId, "FATAL %s (0x%08lX) at 0x%016llX faultaddr=0x%016llX",
             CodeName(code), static_cast<unsigned long>(code),
             static_cast<unsigned long long>(addr),
             static_cast<unsigned long long>(fault));
@@ -202,6 +227,14 @@ namespace Breadcrumbs
             const auto* r    = ep->ExceptionRecord;
             const DWORD code = r->ExceptionCode;
             if (!IsInteresting(code))
+                return EXCEPTION_CONTINUE_SEARCH;
+
+            // A thread that has just overflowed keeps under 2 KiB of committed
+            // stack: Log()'s 512-byte line buffer plus vsnprintf does not fit, and
+            // the fault it takes is not survivable (dispatching the __except above
+            // needs stack too). The crash VEH ran before us and had the fatal
+            // record written from a thread that still has a stack — so leave.
+            if (code == EXCEPTION_STACK_OVERFLOW)
                 return EXCEPTION_CONTINUE_SEARCH;
 
             const auto addr = reinterpret_cast<std::uint64_t>(r->ExceptionAddress);

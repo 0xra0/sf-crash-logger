@@ -194,27 +194,8 @@ namespace LogWriter
         return base != 0 && base != PAGE_NOACCESS && base != PAGE_EXECUTE;
     }
 
-    // The whole reserved stack span of the calling thread, committed or not.
-    // Win8+; absent hosts simply skip the stack-overflow note.
-    static bool CurrentThreadStack(std::uint64_t& low, std::uint64_t& high)
-    {
-        auto* k32 = GetModuleHandleW(L"kernel32.dll");
-        if (!k32)
-            return false;
-        using Fn = void(WINAPI*)(PULONG_PTR, PULONG_PTR);
-        auto fn = reinterpret_cast<Fn>(GetProcAddress(k32, "GetCurrentThreadStackLimits"));
-        if (!fn)
-            return false;
-
-        ULONG_PTR l = 0, h = 0;
-        fn(&l, &h);
-        low  = l;
-        high = h;
-        return high > low;
-    }
-
     // `op` is EXCEPTION_RECORD::ExceptionInformation[0]: 0 read, 1 write, 8 DEP.
-    static std::string FaultRegionDetail(std::uint64_t addr, ULONG_PTR op)
+    static std::string FaultRegionDetail(std::uint64_t addr, ULONG_PTR op, const CrashContext& crash)
     {
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) != sizeof(mbi))
@@ -255,10 +236,11 @@ namespace LogWriter
         }
 
         // Membership in the faulting thread's own stack is what turns an otherwise
-        // anonymous reserved-page fault into a diagnosis of stack overflow.
-        std::uint64_t low = 0, high = 0;
-        if (CurrentThreadStack(low, high) && addr >= low && addr < high) {
-            out += std::format("  Note:    inside this thread's stack (0x{:016X} - 0x{:016X})\n", low, high);
+        // anonymous reserved-page fault into a diagnosis of stack overflow. The
+        // bounds come from the crash context: this may not be the crashing thread.
+        if (crash.stackHigh > crash.stackLow && addr >= crash.stackLow && addr < crash.stackHigh) {
+            out += std::format("  Note:    inside the crashing thread's stack (0x{:016X} - 0x{:016X})\n",
+                crash.stackLow, crash.stackHigh);
             if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
                 out += "  Note:    the stack has not grown this far — stack overflow\n";
         }
@@ -266,13 +248,13 @@ namespace LogWriter
         return out;
     }
 
-    static std::string FaultRegion(const EXCEPTION_RECORD* rec)
+    static std::string FaultRegion(const EXCEPTION_RECORD* rec, const CrashContext& crash)
     {
         if ((rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION &&
              rec->ExceptionCode != EXCEPTION_IN_PAGE_ERROR) ||
             rec->NumberParameters < 2)
             return {};
-        return FaultRegionDetail(rec->ExceptionInformation[1], rec->ExceptionInformation[0]);
+        return FaultRegionDetail(rec->ExceptionInformation[1], rec->ExceptionInformation[0], crash);
     }
 
     // Base address of this plugin's own module. Used to exclude ourselves from
@@ -391,7 +373,7 @@ namespace LogWriter
     }
 
     void Write(
-        EXCEPTION_POINTERS*              ep,
+        const CrashContext&              crash,
         const std::vector<StackFrame>&   frames,
         const std::vector<ScannedValue>& scanned,
         const std::vector<ModuleInfo>&   modules,
@@ -405,8 +387,8 @@ namespace LogWriter
         if (!out)
             return;
 
-        const auto* rec = ep->ExceptionRecord;
-        const auto* ctx = ep->ContextRecord;
+        const auto* rec = crash.ep->ExceptionRecord;
+        const auto* ctx = crash.ep->ContextRecord;
 
         // ------------------------------------------------------------------ header
         // Access type feeds the signature: a read and a write at the same site are
@@ -438,13 +420,13 @@ namespace LogWriter
             out << std::format(" ({}{})", excMod, (excModI && excModI->isSFSEPlugin) ? " [SFSE]" : "");
         out << IdSuffix(excAddr) << "\n";
         // The same fault means different things on the main thread and on a worker.
-        out << std::format("  Thread:  {}\n", ThreadInfo::Describe(GetCurrentThreadId()));
+        out << std::format("  Thread:  {}\n", ThreadInfo::Describe(crash.threadId));
 
         if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
             rec->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) {
             out << AccessViolationDetail(rec);
             out << FaultAnalysis(rec, ctx);
-            out << FaultRegion(rec);
+            out << FaultRegion(rec, crash);
         }
         out << "\n";
 
@@ -694,7 +676,7 @@ namespace LogWriter
     }
 
     void WriteMiniDump(
-        EXCEPTION_POINTERS*          ep,
+        const CrashContext&          crash,
         const std::filesystem::path& logDir,
         const std::string&           fileTimestamp)
     {
@@ -710,9 +692,12 @@ namespace LogWriter
             return;
         }
 
+        // ThreadId must name the thread that crashed, not the one writing the dump:
+        // it is what a debugger selects on open. ClientPointers stays FALSE because
+        // ExceptionPointers is an address in this process either way.
         MINIDUMP_EXCEPTION_INFORMATION mei{
-            .ThreadId          = GetCurrentThreadId(),
-            .ExceptionPointers = ep,
+            .ThreadId          = crash.threadId,
+            .ExceptionPointers = crash.ep,
             .ClientPointers    = FALSE,
         };
 

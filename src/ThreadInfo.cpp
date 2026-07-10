@@ -97,9 +97,6 @@ namespace ThreadInfo
     // host (or a Wine build without it) simply falls through to the legacy table.
     static std::string Modern(std::uint32_t tid)
     {
-        if (tid != GetCurrentThreadId())
-            return {};   // only the running thread is cheap and safe to ask
-
         auto* k32 = GetModuleHandleW(L"kernel32.dll");
         if (!k32)
             return {};
@@ -109,12 +106,26 @@ namespace ThreadInfo
         if (!fn)
             return {};
 
-        PWSTR desc = nullptr;
-        if (FAILED(fn(GetCurrentThread(), &desc)) || !desc)
+        // A stack-overflow report is written by the reporter thread, which is
+        // describing somebody else — so open the target rather than give up and
+        // lose the name. The crashing thread is parked in the handoff wait, so it
+        // is still alive and openable. GetCurrentThread() is a pseudo-handle and
+        // must not be closed; the opened one must.
+        const bool self   = (tid == GetCurrentThreadId());
+        HANDLE     opened = self ? nullptr : OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+        HANDLE     thread = self ? GetCurrentThread() : opened;
+        if (!thread)
             return {};
 
-        std::string out = NarrowW(desc);
-        LocalFree(desc);
+        std::string out;
+        PWSTR       desc = nullptr;
+        if (SUCCEEDED(fn(thread, &desc)) && desc) {
+            out = NarrowW(desc);
+            LocalFree(desc);
+        }
+
+        if (opened)
+            CloseHandle(opened);
         return out;
     }
 

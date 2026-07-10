@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CrashContext.h"
 #include "Modules.h"
 #include "RTTIReader.h"
 #include "StackWalker.h"
@@ -13,15 +14,17 @@ namespace LogWriter
 
     std::filesystem::path GetLogDir();
 
+    // Both may run on the reporter thread rather than the crashing one, so they
+    // take the crash context instead of consulting the current thread.
     void Write(
-        EXCEPTION_POINTERS*                ep,
+        const CrashContext&                crash,
         const std::vector<StackFrame>&     frames,
         const std::vector<ScannedValue>&   scanned,
         const std::vector<ModuleInfo>&     modules,
         const std::string&                 fileTimestamp);
 
     void WriteMiniDump(
-        EXCEPTION_POINTERS*        ep,
+        const CrashContext&          crash,
         const std::filesystem::path& logDir,
         const std::string&           fileTimestamp);
 

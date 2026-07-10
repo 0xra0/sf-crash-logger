@@ -1,6 +1,7 @@
 #include "PCH.h"
 #include "CrashHandler.h"
 #include "Breadcrumbs.h"
+#include "CrashContext.h"
 #include "LogWriter.h"
 #include "Modules.h"
 #include "RTTIReader.h"
@@ -16,6 +17,23 @@ namespace CrashHandler
     static std::atomic_bool             s_hijackLogged{ false };
     static HMODULE                      s_selfModule = nullptr;
     static void*                        s_ldrCookie  = nullptr;
+
+    // Reporter thread — see ReportOffThread. Parked on s_reportRequest for the
+    // whole session; it exists so that a thread which has run out of stack still
+    // has somewhere to write its report from.
+    static HANDLE       s_reporterThread = nullptr;
+    static HANDLE       s_reportRequest  = nullptr;   // crashing thread -> reporter
+    static HANDLE       s_reportDone     = nullptr;   // reporter -> crashing thread
+    static CrashContext s_reportCrash{};
+
+    // The reporter allocates, so it can block on a lock the crashing thread was
+    // holding when it died (the CRT heap lock, say). Bound the wait rather than
+    // hang the process for ever: the breadcrumb trail is already on disk.
+    static constexpr DWORD kReportTimeoutMs = 30'000;
+
+    // A fresh 1 MiB, reserved not committed. The report needs ~20 KiB of stack for
+    // dbghelp alone; the dying thread has under 2 KiB.
+    static constexpr SIZE_T kReporterStackBytes = 1u << 20;
 
     // The system DLLs whose exports we hook. We never patch *their* IATs: the
     // hooks exist to intercept other modules (plugins, overlays, ASI loaders)
@@ -68,19 +86,29 @@ namespace CrashHandler
     // A function containing __try may not also contain objects that require
     // unwinding: MSVC rejects it outright (C2712) and clang miscompiles it under
     // /EHa. The report writer owns vectors and paths, so it lives in its own frame
-    // and ProcessCrash guards only the call. Same for the failure log, whose
+    // and WriteReport guards only the call. Same for the failure log, whose
     // formatting builds temporaries.
-    __declspec(noinline) static void WriteFullReport(EXCEPTION_POINTERS* ep)
+    //
+    // Nothing below may ask about the *current* thread: on the stack-overflow path
+    // this all runs on the reporter thread. Everything about the victim is in
+    // `crash`. StackWalker::Walk and ScanStack already take a CONTEXT and use only
+    // process-wide handles, so they work across threads unchanged.
+    __declspec(noinline) static void WriteFullReport(const CrashContext& crash)
     {
+        // Guaranteed, allocation-free record first — flushed to disk before the
+        // rich writer runs, so we leave evidence even if that writer itself faults
+        // (e.g. on a corrupted heap).
+        Breadcrumbs::LogFatal(crash);
+
         const auto timestamp = LogWriter::MakeFileTimestamp();
         const auto logDir    = LogWriter::GetLogDir();
 
         auto modules = Modules::GetAll();
-        auto frames  = StackWalker::Walk(ep->ContextRecord);
-        auto scanned = StackWalker::ScanStack(ep->ContextRecord);
+        auto frames  = StackWalker::Walk(crash.ep->ContextRecord);
+        auto scanned = StackWalker::ScanStack(crash.ep->ContextRecord);
 
-        LogWriter::Write(ep, frames, scanned, modules, timestamp);
-        LogWriter::WriteMiniDump(ep, logDir, timestamp);
+        LogWriter::Write(crash, frames, scanned, modules, timestamp);
+        LogWriter::WriteMiniDump(crash, logDir, timestamp);
     }
 
     __declspec(noinline) static void ReportSecondaryFailure()
@@ -88,26 +116,76 @@ namespace CrashHandler
         REX::ERROR("CrashHandler: secondary exception while writing crash log.");
     }
 
-    // -------------------------------------------------------------------------
-    // Core crash handler — the single place a report is produced.
-    // The atomic flag ensures we only write one log even if several paths fire.
-    // -------------------------------------------------------------------------
-    static void ProcessCrash(EXCEPTION_POINTERS* ep)
+    static void WriteReport(const CrashContext& crash) noexcept
     {
-        if (s_handled.exchange(true))
-            return;
-
-        // Guaranteed, allocation-free record first — flushed to disk before the
-        // rich writer runs, so we leave evidence even if that writer itself faults
-        // (e.g. on a corrupted heap).
-        Breadcrumbs::LogFatal(ep);
-
         __try {
-            WriteFullReport(ep);
+            WriteFullReport(crash);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             ReportSecondaryFailure();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Reporter thread. Parked until a crash needs a stack of its own.
+    //
+    // One-shot on purpose: s_handled admits a single report per process, so this
+    // thread has exactly one job. Looping forever would leave a thread parked in
+    // an INFINITE wait, and a process whose last real thread has died then never
+    // finishes dying — a hang is a worse outcome for a player than a crash.
+    // -------------------------------------------------------------------------
+    static DWORD WINAPI ReporterThreadProc(void*)
+    {
+        if (WaitForSingleObject(s_reportRequest, INFINITE) != WAIT_OBJECT_0)
+            return 0;
+
+        WriteReport(s_reportCrash);
+        SetEvent(s_reportDone);
+        return 0;
+    }
+
+    // Move the report to the reporter thread and block until it is written.
+    //
+    // Runs on a thread with under 2 KiB of committed stack, so it must stay
+    // allocation-free and shallow: publish, signal, wait. The crashing thread
+    // parking in that wait is a bonus — its stack cannot shift under the walk.
+    static bool ReportOffThread(const CrashContext& crash) noexcept
+    {
+        if (!s_reporterThread || !s_reportRequest || !s_reportDone)
+            return false;
+
+        s_reportCrash = crash;            // published by SetEvent's release barrier
+        if (!SetEvent(s_reportRequest))
+            return false;
+
+        return WaitForSingleObject(s_reportDone, kReportTimeoutMs) == WAIT_OBJECT_0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Core crash handler — the single place a report is produced.
+    // The atomic flag ensures we only write one log even if several paths fire.
+    //
+    // `offThread` is set only for a stack overflow, where writing in place is not
+    // possible. Every other crash reports on the crashing thread, as before: it
+    // keeps re-entrant locks re-entrant (a thread that died inside the heap
+    // manager can still take the heap lock again; the reporter thread would
+    // deadlock on it and lose the report to the timeout).
+    // -------------------------------------------------------------------------
+    static void ProcessCrash(EXCEPTION_POINTERS* ep, bool offThread) noexcept
+    {
+        if (s_handled.exchange(true))
+            return;
+
+        const CrashContext crash = CrashContext::Capture(ep);
+
+        if (offThread) {
+            // No fallback to the in-place path: it would fault on the first byte
+            // of stack it touched, and that fault is not survivable either.
+            ReportOffThread(crash);
+            return;
+        }
+
+        WriteReport(crash);
     }
 
     // -------------------------------------------------------------------------
@@ -133,7 +211,7 @@ namespace CrashHandler
         }
 
         EXCEPTION_POINTERS ep{ rec, ctx };
-        ProcessCrash(&ep);
+        ProcessCrash(&ep, /*offThread=*/false);
     }
 
     // -------------------------------------------------------------------------
@@ -196,7 +274,7 @@ namespace CrashHandler
     // -------------------------------------------------------------------------
     static LONG WINAPI SEHFilter(EXCEPTION_POINTERS* ep)
     {
-        ProcessCrash(ep);
+        ProcessCrash(ep, /*offThread=*/false);
 
         if (s_previousFilter)
             return s_previousFilter(ep);
@@ -239,10 +317,28 @@ namespace CrashHandler
     // same dispatch — so re-arming now means a genuinely unhandled exception still
     // lands in SEHFilter on this very fault, while one that a frame handler catches
     // produces no report. That yields the intended backstop with no false positives.
+    //
+    // Stack overflow is the one exception to all of that, because the reasoning
+    // above assumes a later handler can run, and for STATUS_STACK_OVERFLOW none
+    // can: dispatching a frame handler needs stack, and there is none left. Under
+    // Wine the top-level filter is never reached at all and the process simply
+    // dies (measured: the VEH sees the fault, nothing after it does). This VEH is
+    // therefore the last code that will ever run on that thread, so it is where
+    // the report has to be started — off-thread, since ~2 KiB of committed stack
+    // is not enough to write one. We accept the theoretical false positive: a
+    // stack overflow is raised once per thread and recovering from it requires an
+    // explicit _resetstkoflw(), which no game engine does.
     // -------------------------------------------------------------------------
     static LONG WINAPI VEHFilterGuard(EXCEPTION_POINTERS* ep)
     {
-        if (IsCrashCode(ep->ExceptionRecord->ExceptionCode))
+        const DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+        if (code == EXCEPTION_STACK_OVERFLOW) {
+            ProcessCrash(ep, /*offThread=*/true);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        if (IsCrashCode(code))
             EnsureTopLevelFilter();
 
         return EXCEPTION_CONTINUE_SEARCH;
@@ -445,6 +541,27 @@ namespace CrashHandler
 
     // -------------------------------------------------------------------------
 
+    // Everything a stack-overflowed thread will need must already exist: it has no
+    // room to create an event, let alone a thread. Failure is not fatal — we lose
+    // only the stack-overflow report, and Install() carries on.
+    static void StartReporterThread()
+    {
+        s_reportRequest = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        s_reportDone    = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!s_reportRequest || !s_reportDone) {
+            Breadcrumbs::Log("reporter thread: could not create events (0x%lX)",
+                static_cast<unsigned long>(GetLastError()));
+            return;
+        }
+
+        s_reporterThread = CreateThread(nullptr, kReporterStackBytes, &ReporterThreadProc,
+            nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (!s_reporterThread)
+            Breadcrumbs::Log("reporter thread: CreateThread failed (0x%lX) — stack-overflow "
+                             "crashes will not be reported",
+                static_cast<unsigned long>(GetLastError()));
+    }
+
     void Install()
     {
         GetModuleHandleExA(
@@ -453,8 +570,14 @@ namespace CrashHandler
 
         // 0. Resolve the real entry points our IAT stubs forward to, and route
         //    std::terminate through our reporter (bypasses the SEH filter otherwise).
+        //    CrashContext::Init caches the APIs Capture() needs, since Capture runs
+        //    where a GetProcAddress would not fit.
+        CrashContext::Init();
         ResolveRealImports();
         s_prevTerminate = std::set_terminate(&OnTerminate);
+
+        // 0b. The thread that writes reports for crashes with no stack left.
+        StartReporterThread();
 
         // 1. VEH filter guard (registered first, cannot be removed by other plugins)
         AddVectoredExceptionHandler(1, VEHFilterGuard);
