@@ -4,6 +4,7 @@
 #include "CrashHandler.h"
 #include "LoadOrder.h"
 #include "LogWriter.h"
+#include "SystemInfo.h"
 
 // SFSE_PLUGIN_PRELOAD fires before any other plugin initialises.
 // Installing the crash handler here means we also catch crashes from
@@ -25,6 +26,7 @@ SFSE_PLUGIN_LOAD(const SFSE::LoadInterface* a_sfse)
     CrashHandler::OnPostLoad();
     AddressLibrary::Init();   // parse versionlib for ID annotation (off the crash path)
     LoadOrder::Init();        // cache the content-plugin load order
+    SystemInfo::Init();       // cache OS/CPU/GPU/Wine (memory is sampled at crash time)
     LogWriter::WriteStartupLog();
     Breadcrumbs::Log("plugin load complete — game running");
     REX::INFO("CrashLogger loaded. Crash logs -> {}", LogWriter::GetLogDir().string());

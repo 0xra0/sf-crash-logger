@@ -39,4 +39,4 @@ target("CrashLogger")
     set_pcxxheader("include/PCH.h")
 
     -- Windows system libraries (lowercase to match xwin SDK filenames on case-sensitive Linux)
-    add_syslinks("dbghelp", "psapi", "version", "shell32", "ole32")
+    add_syslinks("dbghelp", "psapi", "version", "shell32", "ole32", "user32")

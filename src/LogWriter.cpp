@@ -3,6 +3,7 @@
 #include "AddressLibrary.h"
 #include "Breadcrumbs.h"
 #include "LoadOrder.h"
+#include "SystemInfo.h"
 
 namespace LogWriter
 {
@@ -329,6 +330,26 @@ namespace LogWriter
             }
             out << "\n";
         }
+
+        // ------------------------------------------------------------------ system
+        // The static facts were captured at plugin load; memory is sampled right
+        // here, because a crash caused by commit exhaustion is only visible in the
+        // numbers as they stood at the fault. Memory is therefore still reported
+        // even when the static capture never ran.
+        out << "SYSTEM\n";
+        if (!SystemInfo::Available()) {
+            out << "  (OS/CPU/GPU captured at plugin load — this crash preceded it)\n";
+        } else {
+            const auto& wine = SystemInfo::Wine();
+            out << std::format("  OS:       {}\n", SystemInfo::OS());
+            out << std::format("  Wine:     {}\n",
+                wine.empty() ? "not detected (native Windows)" : wine.c_str());
+            out << std::format("  CPU:      {}\n", SystemInfo::CPU());
+            out << std::format("  GPU:      {}\n", SystemInfo::GPU());
+        }
+        out << std::format("  Memory:   {}\n", SystemInfo::SystemMemory());
+        out << std::format("  Process:  {}\n", SystemInfo::ProcessMemory());
+        out << "\n";
 
         // ------------------------------------------------------------------ breadcrumbs
         // The most recent early-warning trace lines (first-chance exceptions and
