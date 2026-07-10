@@ -154,6 +154,20 @@ namespace LogWriter
         return 0;
     }
 
+    // This plugin's own version, e.g. "0.2.0". The single source of truth is
+    // set_version() in xmake.lua, which the build bakes into the exported
+    // SFSEPlugin_Version block; read it back rather than keeping a second copy
+    // here that a version bump would silently leave stale. REL::Version::string()
+    // would render the unused build field too ("0.2.0.0"), so format it directly.
+    static std::string PluginVersion()
+    {
+        if (const auto* pvd = SFSE::PluginVersionData::GetSingleton()) {
+            const auto v = pvd->GetPluginVersion();
+            return std::format("{}.{}.{}", v.major(), v.minor(), v.patch());
+        }
+        return "unknown";
+    }
+
     // "  ID: <id>+0xoffset" if the address resolves to an Address Library ID
     // (only game-executable addresses do), else empty.
     static std::string IdSuffix(std::uint64_t addr)
@@ -261,7 +275,7 @@ namespace LogWriter
         const auto* ctx = ep->ContextRecord;
 
         // ------------------------------------------------------------------ header
-        out << "Starfield Crash Logger v0.2.0\n";
+        out << std::format("Starfield Crash Logger v{}\n", PluginVersion());
         out << std::format("Timestamp: {}\n", ReadableTimestamp());
         out << std::format("Address Library: {}\n\n", AddressLibrary::Status());
 
@@ -495,8 +509,8 @@ namespace LogWriter
         if (!out)
             return;
 
-        out << std::format("[{}] CrashLogger v0.2.0 loaded — crash logs -> {}\n",
-            ReadableTimestamp(), logDir.string());
+        out << std::format("[{}] CrashLogger v{} loaded — crash logs -> {}\n",
+            ReadableTimestamp(), PluginVersion(), logDir.string());
         out.flush();
     }
 
