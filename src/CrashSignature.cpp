@@ -137,7 +137,7 @@ namespace CrashSignature
             std::uint64_t gameBase = 0, gameEnd = 0;
             GameModuleBounds(gameBase, gameEnd);   // zeroes on failure: handled below
             return ComputeFrom(exceptionCode, accessOp, frames, modules, gameBase, gameEnd);
-        } catch (...) {
+        } catch (const std::exception&) {
             Result r;
             r.reason = "signature computation failed";
             return r;

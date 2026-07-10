@@ -67,7 +67,7 @@ namespace Modules
             try {
                 auto pluginsDir   = GetSFSEPluginsDir();
                 info.isSFSEPlugin = (std::filesystem::path(pathBuf).parent_path() == pluginsDir);
-            } catch (...) {}
+            } catch (const std::exception&) {}
 
             modules.push_back(std::move(info));
         }

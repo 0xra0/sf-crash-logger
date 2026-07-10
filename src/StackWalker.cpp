@@ -102,20 +102,20 @@ namespace StackWalker
         return result;
     }
 
-    std::vector<ScannedValue> ScanStack(const CONTEXT* ctx, std::size_t maxBytes)
+    // A function containing __try may not also contain objects that require
+    // unwinding: MSVC rejects it outright (C2712) and clang miscompiles it under
+    // /EHa. So the guarded read fills a caller-provided buffer — no allocation, no
+    // destructors — and the vector lives in ScanStack, outside the guard.
+    static std::size_t ScanRaw(std::uint64_t rsp, std::size_t maxBytes,
+        ScannedValue* out, std::size_t maxOut) noexcept
     {
-        std::vector<ScannedValue> result;
-
-        const std::uint64_t rsp = ctx->Rsp;
-        if (rsp == 0)
-            return result;
-
+        std::size_t n = 0;
         __try {
             // Clamp the read window to the end of the committed stack region so
             // we never touch the guard page (which would itself fault).
             MEMORY_BASIC_INFORMATION mbi{};
             if (VirtualQuery(reinterpret_cast<void*>(rsp), &mbi, sizeof(mbi)) == 0)
-                return result;
+                return 0;
 
             const std::uint64_t regionEnd =
                 reinterpret_cast<std::uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -124,19 +124,33 @@ namespace StackWalker
             if (end > regionEnd)
                 end = regionEnd;
 
-            result.reserve(256);
-            for (std::uint64_t addr = (rsp + 7) & ~std::uint64_t{ 7 }; addr + 8 <= end; addr += 8) {
+            for (std::uint64_t addr = (rsp + 7) & ~std::uint64_t{ 7 };
+                 addr + 8 <= end && n < maxOut; addr += 8) {
                 const auto value = *reinterpret_cast<const std::uint64_t*>(addr);
 
                 // Keep only values that could be a canonical user-mode pointer.
                 // Non-pointer scalars and small integers are filtered by the caller
                 // when it fails to resolve them to a module or RTTI object.
-                if (value >= 0x10000 && value <= 0x7FFFFFFEFFFF)
-                    result.push_back({ addr, value });
+                if (value >= 0x10000 && value <= 0x7FFFFFFEFFFF) {
+                    out[n].stackAddress = addr;
+                    out[n].value        = value;
+                    ++n;
+                }
             }
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
 
+        return n;
+    }
+
+    std::vector<ScannedValue> ScanStack(const CONTEXT* ctx, std::size_t maxBytes)
+    {
+        const std::uint64_t rsp = ctx->Rsp;
+        if (rsp == 0)
+            return {};
+
+        std::vector<ScannedValue> result(maxBytes / sizeof(std::uint64_t));
+        result.resize(ScanRaw(rsp, maxBytes, result.data(), result.size()));
         return result;
     }
 }

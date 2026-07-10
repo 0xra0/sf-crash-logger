@@ -171,7 +171,7 @@ namespace SystemInfo
             s_ready = true;
             REX::INFO("SystemInfo: {} | {} | {}{}", s_os, s_cpu, s_gpu,
                 s_wine.empty() ? "" : std::format(" | Wine {}", s_wine));
-        } catch (...) {
+        } catch (const std::exception&) {
             s_ready = false;
         }
     }

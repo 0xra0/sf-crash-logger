@@ -38,5 +38,15 @@ target("CrashLogger")
     add_includedirs("include")
     set_pcxxheader("include/PCH.h")
 
+    -- Asynchronous exception handling. clang-cl, unlike MSVC, only treats ordinary
+    -- instructions as potentially faulting under /EHa; with the default /EHsc a
+    -- __try/__except block does NOT catch a hardware access violation, which would
+    -- silently disable every guarded read in the crash handler. The last /EH flag
+    -- wins, so this overrides the /EHsc the plugin rule adds.
+    --
+    -- /EHa also makes `catch (...)` swallow SEH exceptions, which is why the
+    -- codebase uses typed `catch (const std::exception&)` instead — those do not.
+    add_cxxflags("/EHa", {tools = {"clang_cl", "cl"}})
+
     -- Windows system libraries (lowercase to match xwin SDK filenames on case-sensitive Linux)
     add_syslinks("dbghelp", "psapi", "version", "shell32", "ole32", "user32")

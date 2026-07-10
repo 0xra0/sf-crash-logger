@@ -85,16 +85,20 @@ namespace RTTIReader
                !(mbi.Protect & PAGE_GUARD);
     }
 
-    std::string GetTypeName(std::uint64_t ptr)
+    // A function containing __try may not also contain objects that require
+    // unwinding: MSVC rejects it outright (C2712) and clang miscompiles it under
+    // /EHa. So the guarded pointer-chase returns a raw pointer into the module
+    // image, and the string work happens in GetTypeName, outside the guard.
+    static const char* FindMangledName(std::uint64_t ptr) noexcept
     {
         __try {
             if (!IsValidReadableAddress(ptr))
-                return {};
+                return nullptr;
 
             // Read vtable pointer
             auto vtablePtr = *reinterpret_cast<std::uint64_t*>(ptr);
             if (!IsValidReadableAddress(vtablePtr - 8))
-                return {};
+                return nullptr;
 
             // vtable[-1] is the RVA of the RTTICompleteObjectLocator
             auto colRva = *reinterpret_cast<std::int32_t*>(vtablePtr - 8);
@@ -105,31 +109,41 @@ namespace RTTIReader
                     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                     reinterpret_cast<LPCSTR>(vtablePtr),
                     &hModule) || !hModule) {
-                return {};
+                return nullptr;
             }
             auto* imageBase = reinterpret_cast<std::uint8_t*>(hModule);
 
             // Resolve COL from its RVA
             auto* col = reinterpret_cast<RTTICompleteObjectLocator*>(imageBase + colRva);
             if (!IsValidReadableAddress(reinterpret_cast<std::uint64_t>(col)))
-                return {};
+                return nullptr;
 
             // Validate x64 signature and self-referential RVA (extra sanity check)
             if (col->signature != 1)
-                return {};
+                return nullptr;
             if (reinterpret_cast<std::uint64_t>(imageBase + col->pSelf) !=
                 reinterpret_cast<std::uint64_t>(col))
-                return {};
+                return nullptr;
 
             // Resolve TypeDescriptor
             auto* typeDesc = reinterpret_cast<RTTITypeDescriptor*>(imageBase + col->pTypeDescriptor);
             if (!IsValidReadableAddress(reinterpret_cast<std::uint64_t>(typeDesc)))
-                return {};
+                return nullptr;
 
-            return Demangle(typeDesc->name);
+            // The name lives in the image; validate before handing it out, since
+            // the caller reads it outside this guard.
+            if (!IsValidReadableAddress(reinterpret_cast<std::uint64_t>(typeDesc->name)))
+                return nullptr;
+            return typeDesc->name;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            return {};
+            return nullptr;
         }
+    }
+
+    std::string GetTypeName(std::uint64_t ptr)
+    {
+        const char* mangled = FindMangledName(ptr);
+        return mangled ? Demangle(mangled) : std::string{};
     }
 }

@@ -65,6 +65,29 @@ namespace CrashHandler
         }
     }
 
+    // A function containing __try may not also contain objects that require
+    // unwinding: MSVC rejects it outright (C2712) and clang miscompiles it under
+    // /EHa. The report writer owns vectors and paths, so it lives in its own frame
+    // and ProcessCrash guards only the call. Same for the failure log, whose
+    // formatting builds temporaries.
+    __declspec(noinline) static void WriteFullReport(EXCEPTION_POINTERS* ep)
+    {
+        const auto timestamp = LogWriter::MakeFileTimestamp();
+        const auto logDir    = LogWriter::GetLogDir();
+
+        auto modules = Modules::GetAll();
+        auto frames  = StackWalker::Walk(ep->ContextRecord);
+        auto scanned = StackWalker::ScanStack(ep->ContextRecord);
+
+        LogWriter::Write(ep, frames, scanned, modules, timestamp);
+        LogWriter::WriteMiniDump(ep, logDir, timestamp);
+    }
+
+    __declspec(noinline) static void ReportSecondaryFailure()
+    {
+        REX::ERROR("CrashHandler: secondary exception while writing crash log.");
+    }
+
     // -------------------------------------------------------------------------
     // Core crash handler — the single place a report is produced.
     // The atomic flag ensures we only write one log even if several paths fire.
@@ -80,18 +103,10 @@ namespace CrashHandler
         Breadcrumbs::LogFatal(ep);
 
         __try {
-            const auto timestamp = LogWriter::MakeFileTimestamp();
-            const auto logDir    = LogWriter::GetLogDir();
-
-            auto modules = Modules::GetAll();
-            auto frames  = StackWalker::Walk(ep->ContextRecord);
-            auto scanned = StackWalker::ScanStack(ep->ContextRecord);
-
-            LogWriter::Write(ep, frames, scanned, modules, timestamp);
-            LogWriter::WriteMiniDump(ep, logDir, timestamp);
+            WriteFullReport(ep);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            REX::ERROR("CrashHandler: secondary exception while writing crash log.");
+            ReportSecondaryFailure();
         }
     }
 

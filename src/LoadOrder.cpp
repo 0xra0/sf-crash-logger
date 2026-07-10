@@ -75,7 +75,7 @@ namespace LoadOrder
             s_entries = ParseStream(in);
             s_loaded  = true;
             REX::INFO("LoadOrder: {} plugins from {}.", s_entries.size(), s_path);
-        } catch (...) {
+        } catch (const std::exception&) {
             s_loaded = false;
             s_entries.clear();
         }

@@ -64,7 +64,7 @@ namespace AddressLibrary
             for (std::size_t i = 0; i < 4 && std::getline(ss, tok, L'.'); ++i) {
                 try {
                     out[i] = static_cast<std::uint16_t>(std::stoi(tok));
-                } catch (...) {
+                } catch (const std::exception&) {
                     out[i] = 0;
                 }
             }
@@ -271,7 +271,7 @@ namespace AddressLibrary
                 REX::INFO("AddressLibrary: loaded {} ({} ids).", s_dbVersion, s_entries.size());
             else
                 REX::INFO("AddressLibrary: no matching versionlib for game {} — IDs disabled.", s_gameVersion);
-        } catch (...) {
+        } catch (const std::exception&) {
             s_available = false;
             s_entries.clear();
         }
