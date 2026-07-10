@@ -3,8 +3,12 @@
 
 namespace StackWalker
 {
-    // DbgHelp is not thread-safe; all calls must be serialized.
-    static std::mutex s_dbghelpMutex;
+    // DbgHelp is not thread-safe; all calls must be serialized. Timed, not plain:
+    // on the crash path a lock held by a thread that will never run again — or by
+    // this thread, if a fault inside dbghelp re-enters us — would hang the report
+    // forever. Frames matter more than symbols, so we give up waiting.
+    static std::timed_mutex          s_dbghelpMutex;
+    static constexpr auto            kSymbolLockWait = std::chrono::seconds(2);
 
     static std::string ResolveSymbol(HANDLE process, std::uint64_t address, std::uint64_t& outDisplacement)
     {
@@ -39,63 +43,91 @@ namespace StackWalker
         return {};
     }
 
+    std::size_t Unwind(const CONTEXT* ctx, std::uint64_t* out, std::size_t maxFrames)
+    {
+        if (!ctx || !out || maxFrames == 0)
+            return 0;
+
+        CONTEXT     c = *ctx;   // unwinding mutates the context; keep the caller's
+        std::size_t n = 0;
+
+        __try {
+            std::uint64_t lastRsp = 0;
+            while (n < maxFrames && c.Rip != 0) {
+                out[n++] = c.Rip;
+
+                // The stack must move towards higher addresses on every frame.
+                // Corrupt unwind data can otherwise spin us forever.
+                if (c.Rsp <= lastRsp && lastRsp != 0)
+                    break;
+                lastRsp = c.Rsp;
+
+                DWORD64 imageBase = 0;
+                auto*   function  = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+
+                if (!function) {
+                    // A leaf function with no unwind data: by the x64 ABI it cannot
+                    // have moved RSP, so its return address is sitting at [RSP].
+                    if (c.Rsp == 0)
+                        break;
+                    c.Rip = *reinterpret_cast<const std::uint64_t*>(c.Rsp);
+                    c.Rsp += sizeof(std::uint64_t);
+                    continue;
+                }
+
+                PVOID   handlerData      = nullptr;
+                DWORD64 establisherFrame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, function, &c,
+                    &handlerData, &establisherFrame, nullptr);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // A bad frame ends the walk; everything captured so far still stands.
+        }
+
+        return n;
+    }
+
     std::vector<StackFrame> Walk(CONTEXT* ctx, std::size_t maxFrames)
     {
-        // Work on a copy so StackWalk64 doesn't clobber the original context.
-        CONTEXT ctxCopy = *ctx;
+        constexpr std::size_t kMaxAddresses = 256;
+        if (maxFrames > kMaxAddresses)
+            maxFrames = kMaxAddresses;
+
+        // Frames first, with no dependency on dbghelp: whatever happens below, the
+        // report gets a stack.
+        std::uint64_t     addresses[kMaxAddresses]{};
+        const std::size_t count = Unwind(ctx, addresses, maxFrames);
+
+        std::vector<StackFrame> result;
+        result.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            StackFrame sf;
+            sf.address = addresses[i];
+            result.push_back(std::move(sf));
+        }
+
+        std::unique_lock lock(s_dbghelpMutex, std::defer_lock);
+        if (!lock.try_lock_for(kSymbolLockWait))
+            return result;   // symbols are a nicety; addresses are the evidence
 
         HANDLE process = GetCurrentProcess();
-        HANDLE thread  = GetCurrentThread();
-
-        std::lock_guard lock(s_dbghelpMutex);
 
         // Set options BEFORE SymInitialize: with fInvadeProcess = TRUE it enumerates
         // and registers every loaded module up front, and only SYMOPT_DEFERRED_LOADS
         // (which must already be set at that point) keeps it from eagerly loading
         // every PDB — an expensive, heap-heavy operation at the worst possible moment.
         SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS);
-        SymInitialize(process, nullptr, TRUE);
+        if (!SymInitialize(process, nullptr, TRUE))
+            return result;
 
-        STACKFRAME64 frame{};
-        frame.AddrPC.Offset    = ctxCopy.Rip;
-        frame.AddrPC.Mode      = AddrModeFlat;
-        frame.AddrFrame.Offset = ctxCopy.Rbp;
-        frame.AddrFrame.Mode   = AddrModeFlat;
-        frame.AddrStack.Offset = ctxCopy.Rsp;
-        frame.AddrStack.Mode   = AddrModeFlat;
-
-        std::vector<StackFrame> result;
-        result.reserve(64);
-
-        for (std::size_t i = 0; i < maxFrames; ++i) {
-            if (!StackWalk64(
-                    IMAGE_FILE_MACHINE_AMD64,
-                    process,
-                    thread,
-                    &frame,
-                    &ctxCopy,
-                    nullptr,
-                    SymFunctionTableAccess64,
-                    SymGetModuleBase64,
-                    nullptr)) {
-                break;
-            }
-
-            if (frame.AddrPC.Offset == 0)
-                break;
-
-            StackFrame sf;
-            sf.address = frame.AddrPC.Offset;
-
-            auto [modName, modBase]  = ResolveModule(process, sf.address);
-            sf.moduleName            = std::move(modName);
-            sf.moduleBase            = modBase;
-            sf.symbolName            = ResolveSymbol(process, sf.address, sf.symbolDisplacement);
-            auto [srcFile, srcLine]  = ResolveSourceLine(process, sf.address);
-            sf.sourceFile            = std::move(srcFile);
-            sf.sourceLine            = srcLine;
-
-            result.push_back(std::move(sf));
+        for (auto& sf : result) {
+            auto [modName, modBase] = ResolveModule(process, sf.address);
+            sf.moduleName           = std::move(modName);
+            sf.moduleBase           = modBase;
+            sf.symbolName           = ResolveSymbol(process, sf.address, sf.symbolDisplacement);
+            auto [srcFile, srcLine] = ResolveSourceLine(process, sf.address);
+            sf.sourceFile           = std::move(srcFile);
+            sf.sourceLine           = srcLine;
         }
 
         SymCleanup(process);

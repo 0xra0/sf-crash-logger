@@ -560,7 +560,7 @@ namespace LogWriter
         }
 
         // ------------------------------------------------------------------ stack trace
-        out << std::format("STACK TRACE ({} frames, frame-pointer unwind)\n", frames.size());
+        out << std::format("STACK TRACE ({} frames, unwind-data walk)\n", frames.size());
         for (std::size_t i = 0; i < frames.size(); ++i) {
             const auto& f = frames[i];
 
@@ -591,7 +591,7 @@ namespace LogWriter
         // ------------------------------------------------------------------ stack scan
         // Every value on the raw stack that resolves to a module (return address)
         // or a live RTTI object. Recovers the deeper frames the strict unwinder
-        // above drops when optimised code omits frame-pointer/unwind data.
+        // above drops when a function is missing or has corrupt unwind data.
         out << "STACK SCAN (resolvable pointers on the stack; RSP-relative offsets)\n";
         {
             std::size_t   shown     = 0;

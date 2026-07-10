@@ -20,8 +20,17 @@ struct ScannedValue
 
 namespace StackWalker
 {
-    // Walk the call stack from the given exception context.
-    // Returns up to maxFrames resolved frames.
+    // Capture return addresses by unwinding with the process's own unwind data
+    // (RtlLookupFunctionEntry + RtlVirtualUnwind) — the same mechanism the OS uses
+    // to dispatch exceptions. Touches no symbols, takes no lock, allocates nothing,
+    // and cannot block, so it still produces a stack when dbghelp is wedged or the
+    // heap is corrupted. Writes up to maxFrames addresses to `out`, returns how many.
+    std::size_t Unwind(const CONTEXT* ctx, std::uint64_t* out, std::size_t maxFrames);
+
+    // Walk the call stack from the given exception context, annotating each frame
+    // with module, symbol, and source line where available. The frames come from
+    // Unwind(); symbolication is a best-effort layer on top and its failure costs
+    // annotations, never frames.
     std::vector<StackFrame> Walk(CONTEXT* ctx, std::size_t maxFrames = 128);
 
     // Linearly scan the crashing thread's stack (from RSP upward) for
