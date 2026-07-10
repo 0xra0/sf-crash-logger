@@ -2,6 +2,7 @@
 #include "AddressLibrary.h"
 #include "Breadcrumbs.h"
 #include "CrashHandler.h"
+#include "LoadOrder.h"
 #include "LogWriter.h"
 
 // SFSE_PLUGIN_PRELOAD fires before any other plugin initialises.
@@ -23,6 +24,7 @@ SFSE_PLUGIN_LOAD(const SFSE::LoadInterface* a_sfse)
     // them, which did not exist when Install() ran at preload.
     CrashHandler::OnPostLoad();
     AddressLibrary::Init();   // parse versionlib for ID annotation (off the crash path)
+    LoadOrder::Init();        // cache the content-plugin load order
     LogWriter::WriteStartupLog();
     Breadcrumbs::Log("plugin load complete — game running");
     REX::INFO("CrashLogger loaded. Crash logs -> {}", LogWriter::GetLogDir().string());

@@ -2,6 +2,7 @@
 #include "LogWriter.h"
 #include "AddressLibrary.h"
 #include "Breadcrumbs.h"
+#include "LoadOrder.h"
 
 namespace LogWriter
 {
@@ -439,8 +440,46 @@ namespace LogWriter
                 out << "  [SFSE]";
             out << "\n";
         }
+        out << "\n";
 
-        out << "\n-- end of crash log --\n";
+        // ------------------------------------------------------------------ plugins
+        // Content load order (.esm/.esp/.esl) from Plugins.txt — the mods the
+        // module list above can't show, since content plugins aren't DLLs.
+        {
+            const auto& lo = LoadOrder::Entries();
+            if (!LoadOrder::Available()) {
+                // Empty path means we never got as far as looking: either the
+                // shell lookup failed, or we crashed before LoadOrder::Init().
+                const auto where = LoadOrder::SourcePath();
+                out << "PLUGINS (content load order)\n";
+                if (where.empty())
+                    out << "  (load order unavailable)\n\n";
+                else
+                    out << std::format("  (not found at {})\n\n", where);
+            } else {
+                std::size_t enabled = 0;
+                for (const auto& e : lo)
+                    enabled += e.enabled ? 1 : 0;
+                out << std::format("PLUGINS (content load order — {} listed, {} enabled)\n",
+                    lo.size(), enabled);
+
+                // The index counts enabled plugins only — a disabled entry takes up
+                // no load slot. It is a position in the load order, not a FormID mod
+                // index: base-game masters are implicit and never appear in Plugins.txt.
+                std::size_t slot = 0;
+                for (const auto& e : lo) {
+                    if (e.enabled)
+                        out << std::format("  [{:>3}] {}\n", slot++, e.name);
+                    else
+                        out << std::format("  [   ] {}  (disabled)\n", e.name);
+                }
+                if (lo.empty())
+                    out << "  (none listed)\n";
+                out << "\n";
+            }
+        }
+
+        out << "-- end of crash log --\n";
         out.flush();
 
         REX::INFO("Crash log: {}", logPath.string());

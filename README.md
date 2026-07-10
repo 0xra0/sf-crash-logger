@@ -16,6 +16,7 @@ An [SFSE](https://sfse.silverlock.org/) plugin for Starfield that captures crash
 - **RTTI object identification** — resolves pointer-sized values to C++ type names via the game's RTTI metadata
 - **Minidump** (`.dmp`) compatible with WinDbg / Visual Studio
 - **Module list** with base addresses, sizes, and version strings; SFSE plugins flagged separately
+- **Content load order** — the `.esm`/`.esp`/`.esl` plugins from `Plugins.txt`, in load order, with disabled entries marked. The module list above only covers loaded DLLs, so this is what answers "which *content* mod was active". The bracketed index is a position in the load order, not a FormID mod index — base-game masters are implicit and never appear in `Plugins.txt`. Read once at plugin load (nothing touches the filesystem on the crash path); if `Plugins.txt` isn't found, the report says where it looked
 - **Startup log** — appends a timestamped line to `CrashLogger.log` every game launch so you can confirm the plugin is active
 
 All analysis runs inside the plugin at crash time — the `.log` is self-contained and readable without symbols, WinDbg, or any post-processing script.
